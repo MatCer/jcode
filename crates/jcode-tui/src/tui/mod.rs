@@ -148,7 +148,13 @@ pub fn disable_keyboard_enhancement() {
     );
 }
 
-/// Reassert terminal modes that terminals may clear while the TUI remains alive.
+/// Reassert the input modes a terminal may clear while the TUI remains alive.
+///
+/// Deliberately excludes focus reporting. Only focus handlers reapply modes, and
+/// terminals such as Ghostty answer a set of mode 1004 with a fresh focus report,
+/// so re-arming it here makes the TUI's reply to a focus event generate another
+/// focus event. Focus reporting is enabled once at startup and again on external
+/// editor resume, and is never disabled while the TUI runs.
 ///
 /// These commands are idempotent. Kitty keyboard enhancement uses its `set`
 /// form rather than the stack-based `push`, keeping the shutdown pop balanced.
@@ -156,15 +162,11 @@ pub(crate) fn reapply_terminal_modes_to(
     writer: &mut impl std::io::Write,
     mouse_capture: bool,
     keyboard_enhanced: bool,
-    focus_change: bool,
 ) -> std::io::Result<()> {
     use crossterm::QueueableCommand;
-    use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
+    use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
 
     writer.queue(EnableBracketedPaste)?;
-    if focus_change {
-        writer.queue(EnableFocusChange)?;
-    }
     if mouse_capture {
         writer.queue(EnableMouseCapture)?;
         // Crossterm toggles Win32 console mouse input on Windows, but ConPTY
@@ -184,41 +186,87 @@ pub(crate) fn reapply_configured_terminal_modes() {
         &mut std::io::stdout(),
         policy.enable_mouse_capture,
         policy.enable_keyboard_enhancement,
-        policy.enable_focus_change,
     ) {
         crate::logging::warn(&format!("failed to reapply terminal modes: {error}"));
     }
 }
 
-#[cfg(test)]
+// Crossterm's `EnableMouseCapture` drives the Windows console API rather than the
+// writer, so these byte-level expectations only describe the VT path.
+#[cfg(all(test, unix))]
 mod terminal_mode_tests {
     use super::reapply_terminal_modes_to;
 
-    #[test]
-    fn reapply_omits_mouse_sequences_when_capture_is_disabled() {
-        let mut output = Vec::new();
-        reapply_terminal_modes_to(&mut output, false, true, true).unwrap();
+    const MOUSE_SEQUENCES: [&str; 5] = [
+        "\x1b[?1000h",
+        "\x1b[?1002h",
+        "\x1b[?1003h",
+        "\x1b[?1015h",
+        "\x1b[?1006h",
+    ];
 
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("\x1b[?2004h\x1b[?1004h"));
-        assert!(!output.contains("\x1b[?1000h"));
-        assert!(output.contains("\x1b[="));
+    fn reapply(mouse_capture: bool, keyboard_enhanced: bool) -> String {
+        let mut output = Vec::new();
+        reapply_terminal_modes_to(&mut output, mouse_capture, keyboard_enhanced).unwrap();
+        String::from_utf8(output).unwrap()
     }
 
     #[test]
-    fn reapply_emits_configured_idempotent_modes_without_keyboard_push() {
-        let mut output = Vec::new();
-        reapply_terminal_modes_to(&mut output, true, true, true).unwrap();
+    fn reapply_never_touches_focus_reporting() {
+        for mouse_capture in [false, true] {
+            for keyboard_enhanced in [false, true] {
+                let output = reapply(mouse_capture, keyboard_enhanced);
+                assert!(
+                    !output.contains("\x1b[?1004h"),
+                    "re-arming focus reports makes terminals such as Ghostty \
+                     answer with another FocusGained"
+                );
+                assert!(
+                    !output.contains("\x1b[?1004l"),
+                    "focus reporting must stay enabled for the session"
+                );
+            }
+        }
+    }
 
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("\x1b[?2004h"));
-        assert!(output.contains("\x1b[?1004h"));
-        assert!(output.contains("\x1b[?1000h"));
-        assert!(output.contains("\x1b[="), "must set Kitty keyboard flags");
-        assert!(
-            !output.contains("\x1b[>"),
-            "must not push the Kitty keyboard stack"
-        );
+    #[test]
+    fn reapply_always_restores_bracketed_paste() {
+        for mouse_capture in [false, true] {
+            for keyboard_enhanced in [false, true] {
+                assert!(reapply(mouse_capture, keyboard_enhanced).contains("\x1b[?2004h"));
+            }
+        }
+    }
+
+    #[test]
+    fn reapply_emits_mouse_sequences_only_when_capture_is_enabled() {
+        for keyboard_enhanced in [false, true] {
+            let enabled = reapply(true, keyboard_enhanced);
+            let disabled = reapply(false, keyboard_enhanced);
+            for sequence in MOUSE_SEQUENCES {
+                assert!(enabled.contains(sequence), "missing {sequence:?}");
+                assert!(!disabled.contains(sequence), "unexpected {sequence:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reapply_sets_kitty_flags_without_pushing_the_stack() {
+        for mouse_capture in [false, true] {
+            let enabled = reapply(mouse_capture, true);
+            assert!(
+                enabled.contains(&format!(
+                    "\x1b[={}u",
+                    super::keyboard_enhancement_flags().bits()
+                )),
+                "must set Kitty keyboard flags"
+            );
+            assert!(
+                !enabled.contains("\x1b[>"),
+                "must not push the Kitty keyboard stack"
+            );
+            assert!(!reapply(mouse_capture, false).contains("\x1b[="));
+        }
     }
 }
 
