@@ -178,13 +178,15 @@ pub(crate) fn reapply_terminal_modes_to(
     writer.flush()
 }
 
-pub(crate) fn reapply_configured_terminal_modes() {
+/// Focus handlers must not re-arm focus reporting: some terminals immediately
+/// report their focus state on enable, causing a focus-event feedback loop.
+pub(crate) fn reapply_configured_terminal_modes(rearm_focus_reporting: bool) {
     let policy = crate::perf::tui_policy();
     if let Err(error) = reapply_terminal_modes_to(
         &mut std::io::stdout(),
         policy.enable_mouse_capture,
         policy.enable_keyboard_enhancement,
-        policy.enable_focus_change,
+        policy.enable_focus_change && rearm_focus_reporting,
     ) {
         crate::logging::warn(&format!("failed to reapply terminal modes: {error}"));
     }
@@ -218,6 +220,19 @@ mod terminal_mode_tests {
         assert!(
             !output.contains("\x1b[>"),
             "must not push the Kitty keyboard stack"
+        );
+    }
+
+    #[test]
+    fn reapply_after_focus_gained_omits_focus_reporting_and_preserves_other_modes() {
+        let mut output = Vec::new();
+        reapply_terminal_modes_to(&mut output, true, true, false).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("\x1b[?1004h"));
+        assert_eq!(
+            output,
+            "\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[=7u"
         );
     }
 }
