@@ -543,9 +543,16 @@ mod tests {
         assert_eq!(to_task_graph(&plan).get("r"), lifted.get("r"));
         let old: NodeMeta = serde_json::from_str("{}").unwrap();
         assert_eq!(old, NodeMeta::default());
-        for value in [serde_json::json!({}), serde_json::json!({"allowed_models":[]}), serde_json::json!({"allowed_models":["gpt-6-astra"]})] {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"allowed_models":[]}),
+            serde_json::json!({"allowed_models":["gpt-6-astra"]}),
+        ] {
             let meta: NodeMeta = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(serde_json::to_value(meta).unwrap()["allowed_models"], value["allowed_models"]);
+            assert_eq!(
+                serde_json::to_value(meta).unwrap()["allowed_models"],
+                value["allowed_models"]
+            );
         }
     }
 }

@@ -31,88 +31,10 @@ fn status_age_secs(last_status_change: Instant) -> u64 {
 /// cap still apply.
 pub(super) use jcode_swarm_core::MAX_SWARM_MEMBERS;
 
-/// Walk the `report_back_to_session_id` chain upward from `session_id`,
-/// returning the list of ancestor session ids (parent first, root last).
-///
-/// The spawner/parent edge is encoded by `report_back_to_session_id`: a child
-/// spawned by `P` reports back to `P`. Walking that chain reconstructs the spawn
-/// tree without persisting a separate parent field. Cycles (which should never
-/// happen) are guarded against with a visited set.
-pub(super) fn trusted_swarm_ancestry(
-    members: &HashMap<String, SwarmMember>,
-    session_id: &str,
-) -> anyhow::Result<Vec<String>> {
-    let swarm = members
-        .get(session_id)
-        .and_then(|m| m.swarm_id.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("Missing trusted swarm member '{session_id}'."))?;
-    let mut ancestry = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current = session_id;
-    loop {
-        if !seen.insert(current.to_string()) {
-            anyhow::bail!("Cycle in trusted swarm ancestry.");
-        }
-        let member = members.get(current).ok_or_else(|| {
-            anyhow::anyhow!("Missing trusted swarm ancestor '{current}'; routing denied.")
-        })?;
-        if member.swarm_id.as_deref() != Some(swarm) {
-            anyhow::bail!("Swarm ancestry crosses a swarm boundary.");
-        }
-        ancestry.push(current.to_string());
-        match member.report_back_to_session_id.as_deref() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-    Ok(ancestry)
-}
-
-pub(super) fn swarm_ancestors(
-    members: &HashMap<String, SwarmMember>,
-    session_id: &str,
-) -> Vec<String> {
-    let mut ancestors = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(session_id.to_string());
-    let mut current = session_id.to_string();
-    while let Some(parent) = members
-        .get(&current)
-        .and_then(|member| member.report_back_to_session_id.clone())
-    {
-        if parent == current || !visited.insert(parent.clone()) {
-            break;
-        }
-        ancestors.push(parent.clone());
-        current = parent;
-    }
-    ancestors
-}
-
-/// Depth of `session_id` in the spawn tree: number of ancestors reachable via
-/// the report-back chain. Root coordinators (no report-back owner) are depth 0.
-///
-/// Test-only: the spawn tree no longer enforces a depth cap, so production code
-/// does not consult depth. Kept (behind `cfg(test)`) because the spawn-tree tests
-/// assert ancestor-chain depth directly.
+mod ancestry;
 #[cfg(test)]
-pub(super) fn swarm_spawn_depth(members: &HashMap<String, SwarmMember>, session_id: &str) -> u32 {
-    swarm_ancestors(members, session_id).len() as u32
-}
-
-/// True when `ancestor` is `session_id` itself or any transitive spawner of it.
-/// Used to decide whether a requester may manage (stop/control) a target: an
-/// agent owns its entire spawned subtree.
-pub(super) fn swarm_is_self_or_ancestor(
-    members: &HashMap<String, SwarmMember>,
-    ancestor: &str,
-    session_id: &str,
-) -> bool {
-    ancestor == session_id
-        || swarm_ancestors(members, session_id)
-            .iter()
-            .any(|candidate| candidate == ancestor)
-}
+use ancestry::swarm_spawn_depth;
+pub(super) use ancestry::{swarm_ancestors, swarm_is_self_or_ancestor, trusted_swarm_ancestry};
 
 const DEFAULT_SWARM_STATUS_DEBOUNCE_MEMBER_THRESHOLD: usize = 2;
 const DEFAULT_SWARM_STATUS_DEBOUNCE_MS: u64 = 75;
