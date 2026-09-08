@@ -187,6 +187,7 @@ struct ProcessingState<'a> {
 
 struct SwarmStatusRefs<'a> {
     members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
+    plans: &'a Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
     event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
@@ -841,6 +842,7 @@ pub(super) async fn handle_client(
                     record_processing_completion(
                         done_session.as_deref(), result, completion_report,
                         &SwarmStatusRefs {
+                            plans: &swarm_plans,
                             members: &swarm_members,
                             swarms_by_id: &swarms_by_id,
                             event_history: &event_history,
@@ -1049,6 +1051,7 @@ pub(super) async fn handle_client(
                 &session_control,
                 &client_event_tx,
                 &SwarmStatusRefs {
+                    plans: &swarm_plans,
                     members: &swarm_members,
                     swarms_by_id: &swarms_by_id,
                     event_history: &event_history,
@@ -1225,6 +1228,7 @@ pub(super) async fn handle_client(
                     &processing_done_tx,
                     active_terminal_env.clone(),
                     &SwarmStatusRefs {
+                        plans: &swarm_plans,
                         members: &swarm_members,
                         swarms_by_id: &swarms_by_id,
                         event_history: &event_history,
@@ -1246,6 +1250,7 @@ pub(super) async fn handle_client(
                     &session_control,
                     &client_event_tx,
                     &SwarmStatusRefs {
+                        plans: &swarm_plans,
                         members: &swarm_members,
                         swarms_by_id: &swarms_by_id,
                         event_history: &event_history,
@@ -1319,6 +1324,7 @@ pub(super) async fn handle_client(
                         &processing_done_tx,
                         active_terminal_env.clone(),
                         &SwarmStatusRefs {
+                            plans: &swarm_plans,
                             members: &swarm_members,
                             swarms_by_id: &swarms_by_id,
                             event_history: &event_history,
@@ -3029,6 +3035,7 @@ pub(super) async fn handle_client(
                         result,
                         report,
                         &SwarmStatusRefs {
+                            plans: &swarm_plans,
                             members: &swarm_members,
                             swarms_by_id: &swarms_by_id,
                             event_history: &event_history,
@@ -3271,12 +3278,24 @@ async fn start_processing_message(
         client_event_tx.clone(),
     );
     let done_tx = processing_done_tx.clone();
+    let routing_members = Arc::clone(swarm.members);
+    let routing_plans = Arc::clone(swarm.plans);
+    let routing_session = client_session_id.to_string();
     crate::logging::info(&format!("Processing message id={} spawning task", id));
     *state.task = Some(tokio::spawn(async move {
         let event_tx = tx.clone();
         let result = match std::panic::AssertUnwindSafe(crate::hooks::with_client_terminal_env(
             client_terminal_env,
-            process_message_streaming_mpsc(agent, &content, images, system_reminder, event_tx),
+            process_routed_message_streaming_mpsc(
+                agent,
+                &content,
+                images,
+                system_reminder,
+                event_tx,
+                &routing_session,
+                &routing_members,
+                &routing_plans,
+            ),
         ))
         .catch_unwind()
         .await
@@ -3606,6 +3625,68 @@ fn move_tool_to_background(
         "SERVER_BACKGROUND_TOOL_RESULT id={} session={} signalled={} ack_queued={}",
         id, session_control.session_id, signalled, ack_queued
     ));
+}
+
+/// Process a message and stream events (mpsc channel - per-client)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "client dispatch needs current swarm plan and policy at consumption"
+)]
+pub(super) async fn process_routed_message_streaming_mpsc(
+    agent: Arc<Mutex<Agent>>,
+    content: &str,
+    images: Vec<(String, String)>,
+    system_reminder: Option<String>,
+    event_tx: mpsc::UnboundedSender<ServerEvent>,
+    session_id: &str,
+    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+) -> Result<()> {
+    let mut agent = agent.lock().await;
+    {
+        // Only queued assignments constrain a new turn. Historical member
+        // routing is not a reason to reject an ordinary user message.
+        let plans = plans.read().await;
+        let pending: Vec<_> = plans
+            .values()
+            .flat_map(|plan| {
+                plan.items
+                    .iter()
+                    .filter(|item| {
+                        item.status == "queued" && item.assigned_to.as_deref() == Some(session_id)
+                    })
+                    .map(|item| {
+                        (
+                            &item.id,
+                            plan.node_meta.get(&item.id).cloned().unwrap_or_default(),
+                        )
+                    })
+            })
+            .collect();
+        if !pending.is_empty() {
+            let members = members.try_read().map_err(|_| {
+                anyhow::anyhow!("Task routing blocked: member policy is busy; retry when idle.")
+            })?;
+            for (item_id, meta) in pending {
+                let routing = crate::protocol::SwarmRoutingStatus {
+                    requested_model: meta.model,
+                    requested_effort: meta.effort,
+                    allowed_models: meta.allowed_models,
+                    resolved_execution: meta.resolved_execution,
+                    ..Default::default()
+                };
+                let provider = agent.provider_fork();
+                super::comm_control::observe_node_execution(
+                    session_id, session_id, &routing, routing.resolved_execution.is_some(),
+                    &agent, &members, provider.as_ref(),
+                ).map_err(|error| anyhow::anyhow!("Task '{}' routing blocked: {error}. Queued work retained; restore its route or reassign the task.", item_id))?;
+            }
+        }
+    }
+    // The same agent guard protects identity from validation into execution.
+    // No global/member/plan lock is held during provider or tool streaming.
+    process_locked_message_streaming_mpsc(&mut agent, content, images, system_reminder, event_tx)
+        .await
 }
 
 /// Process a message and stream events (mpsc channel - per-client)

@@ -420,15 +420,13 @@ async fn requeue_existing_assignment_preserves_prior_progress_history() {
         },
     )])));
 
-    let result = super::requeue_existing_assignment(
-        swarm_id,
+    let result = super::requeue_assignment_in_plan(
+        swarm_plans.write().await.get_mut(swarm_id).unwrap(),
         requester,
         worker,
         "requeue-me",
-        "resume this work".to_string(),
-        &swarm_plans,
-    )
-    .await;
+        "resume this work",
+    );
     assert!(result.is_some(), "requeue should succeed");
 
     let plans = swarm_plans.read().await;
@@ -595,6 +593,9 @@ async fn task_control_retry_re_dispatches_after_recent_identical_retry() {
     let status = wait_for_status_leaving_failed().await;
     assert_ne!(status, "failed", "first retry should dispatch the task");
 
+    // A plan status edit cannot release a running provider's mutex. Wait for
+    // the real prior turn to finish before simulating a retryable failure.
+    wait_for_fixture_worker_idle(&worker, &sessions, &swarm_members).await;
     // Simulate the worker failing quickly, well within the final-state TTL.
     {
         let mut plans = swarm_plans.write().await;
@@ -622,4 +623,27 @@ async fn task_control_retry_re_dispatches_after_recent_identical_retry() {
         status, "failed",
         "second identical retry must actually re-dispatch the task"
     );
+}
+
+async fn wait_for_fixture_worker_idle(
+    session: &str,
+    sessions: &super::SessionAgents,
+    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+) {
+    let agent = sessions.read().await[session].clone();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let completed = members
+                .read()
+                .await
+                .get(session)
+                .is_some_and(|member| matches!(member.status.as_str(), "completed" | "failed"));
+            if completed && agent.try_lock().is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture worker must finish its prior turn before reuse");
 }

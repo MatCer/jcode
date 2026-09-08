@@ -773,6 +773,9 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
         );
     }
 
+    // Completing graph metadata does not stop the first assigned provider
+    // turn. Reuse the worker only once that real turn has released its lock.
+    wait_for_fixture_worker_idle(&fx.worker, &fx.sessions, &fx.swarm_members).await;
     // Assign "ui": its prompt must be hydrated with api's artifact.
     handle_comm_assign_task(
         5,

@@ -317,6 +317,7 @@ async fn cancel_without_local_task_still_signals_session_control() {
         &control,
         &client_event_tx,
         &SwarmStatusRefs {
+            plans: &Arc::new(RwLock::new(HashMap::new())),
             members: &swarm_members,
             swarms_by_id: &swarms_by_id,
             event_history: &event_history,
@@ -384,6 +385,7 @@ async fn deferred_cancel_reset_does_not_erase_newer_cancel() {
             &control,
             &client_event_tx,
             &SwarmStatusRefs {
+                plans: &Arc::new(RwLock::new(HashMap::new())),
                 members: &swarm_members,
                 swarms_by_id: &swarms_by_id,
                 event_history: &event_history,
@@ -557,6 +559,7 @@ fn cancel_aborts_detached_streaming_turn_with_stale_stop_signal() -> anyhow::Res
             &control,
             &client_event_tx,
             &SwarmStatusRefs {
+                plans: &Arc::new(RwLock::new(HashMap::new())),
                 members: &swarm_members,
                 swarms_by_id: &swarms_by_id,
                 event_history: &event_history,
@@ -644,6 +647,7 @@ fn idle_cancel_does_not_arm_the_signal_for_the_next_turn() -> anyhow::Result<()>
             &control,
             &client_event_tx,
             &SwarmStatusRefs {
+                plans: &Arc::new(RwLock::new(HashMap::new())),
                 members: &swarm_members,
                 swarms_by_id: &swarms_by_id,
                 event_history: &event_history,
@@ -958,6 +962,7 @@ fn reload_starting_rejects_new_turn_without_spawning_processing_task() {
             &processing_done_tx,
             Vec::new(),
             &SwarmStatusRefs {
+                plans: &Arc::new(RwLock::new(HashMap::new())),
                 members: &swarm_members,
                 swarms_by_id: &swarms_by_id,
                 event_history: &event_history,
@@ -1060,6 +1065,7 @@ async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attac
         &processing_done_tx,
         Vec::new(),
         &SwarmStatusRefs {
+            plans: &Arc::new(RwLock::new(HashMap::new())),
             members: &swarm_members,
             swarms_by_id: &swarms_by_id,
             event_history: &event_history,
@@ -1185,6 +1191,7 @@ fn accepted_reload_recovery_continuation_marks_intent_delivered() -> anyhow::Res
             &processing_done_tx,
             Vec::new(),
             &SwarmStatusRefs {
+                plans: &Arc::new(RwLock::new(HashMap::new())),
                 members: &swarm_members,
                 swarms_by_id: &swarms_by_id,
                 event_history: &event_history,
@@ -1285,6 +1292,7 @@ fn reload_starting_rejects_new_turns_for_multiple_sessions() {
                 &processing_done_tx,
                 Vec::new(),
                 &SwarmStatusRefs {
+                    plans: &Arc::new(RwLock::new(HashMap::new())),
                     members: &swarm_members,
                     swarms_by_id: &swarms_by_id,
                     event_history: &event_history,

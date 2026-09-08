@@ -2187,17 +2187,48 @@ async fn routing_public_tool_exact_node_spawn_status_policy_and_driver_failures(
     assert!(
         status.output.contains(
             "Actual execution: gpt-5.6-sol provider=openai-oauth api=openai-oauth effort=high"
-        ),
+        ) || status
+            .output
+            .contains("Actual execution: unknown (not verified)"),
         "{}",
         status.output
     );
+    assert!(status.output.contains(
+        "Pinned execution: gpt-5.6-sol provider=openai-oauth api=openai-oauth effort=high"
+    ));
     let plan = tool
         .execute(json!({"action":"plan_status"}), ctx.clone())
         .await
         .unwrap();
     assert!(plan.output.contains("Ready: a"), "{}", plan.output);
     assert!(plan.output.contains("Requested model: gpt-5.6-sol"));
-    assert!(plan.output.contains("Actual execution: gpt-5.6-sol"));
+    assert!(
+        plan.output.contains("Actual execution: gpt-5.6-sol")
+            || plan
+                .output
+                .contains("Actual execution: unknown (not verified)")
+    );
+    // The provider double finishes asynchronously. Once its lock is released,
+    // status must return a fresh observation, not stay permanently unknown.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let idle = tool
+                .execute(
+                    json!({"action":"status","target_session":worker}),
+                    ctx.clone(),
+                )
+                .await
+                .unwrap();
+            if idle.output.contains(
+                "Actual execution: gpt-5.6-sol provider=openai-oauth api=openai-oauth effort=high",
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle worker must expose fresh actual execution");
     let saved = crate::session::Session::load_startup_stub(worker).unwrap();
     assert_eq!(saved.parent_id.as_deref(), Some(coord.as_str()));
     assert_eq!(saved.model.as_deref(), Some("gpt-5.6-sol"));

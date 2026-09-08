@@ -312,7 +312,11 @@ pub(super) async fn handle_comm_status(
                         )
                     }
                 } else {
-                    (None, None, member.runtime.routing.clone())
+                    let mut routing = member.runtime.routing.clone();
+                    if let Some(routing) = routing.as_mut() {
+                        routing.actual_execution = None;
+                    }
+                    (None, None, routing)
                 }
             } else {
                 let mut routing = member.runtime.routing.clone();
@@ -452,13 +456,12 @@ pub(super) async fn handle_comm_plan_status(
     };
 
     let agents = sessions.read().await.clone();
-    let members = swarm_members.read().await;
     for (node_id, session_id) in assignments {
         let Some(routing) = summary.node_routing.get_mut(&node_id) else {
             continue;
         };
-        // A durable pin is only a target. Read the initialized provider, or the
-        // verified in-memory startup snapshot while that live agent is busy.
+        // A durable pin and an old startup observation are not current actual
+        // execution. Busy agents have no fresh observation available.
         routing.actual_execution =
             agents
                 .get(&session_id)
@@ -467,10 +470,7 @@ pub(super) async fn handle_comm_plan_status(
                         agent.provider_fork().as_ref(),
                     )
                     .ok(),
-                    Err(_) => members
-                        .get(&session_id)
-                        .and_then(|member| member.runtime.routing.as_ref())
-                        .and_then(|routing| routing.actual_execution.clone()),
+                    Err(_) => None,
                 });
     }
     let _ = client_event_tx.send(ServerEvent::CommPlanStatusResponse { id, summary });

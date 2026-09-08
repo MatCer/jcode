@@ -145,6 +145,60 @@ pub(super) async fn validate_graph_actor(
     Ok(Some(routing))
 }
 
+pub(super) struct GraphActorGuard<'a> {
+    _agent: tokio::sync::OwnedMutexGuard<crate::agent::Agent>,
+    _members: tokio::sync::RwLockReadGuard<'a, HashMap<String, SwarmMember>>,
+    _sessions: tokio::sync::RwLockReadGuard<
+        'a,
+        HashMap<String, Arc<tokio::sync::Mutex<crate::agent::Agent>>>,
+    >,
+}
+
+/// Called under the final plan lock, never across an await. A running actor
+/// submitting an artifact is not a new execution and is not revoked here.
+pub(super) fn bind_graph_actor<'a>(
+    actor: &str,
+    pinned: bool,
+    routing: &mut Option<crate::protocol::SwarmRoutingStatus>,
+    sessions: &'a super::SessionAgents,
+    members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
+    provider: &Arc<dyn crate::provider::Provider>,
+) -> anyhow::Result<Option<GraphActorGuard<'a>>> {
+    let Some(routing) = routing else {
+        return Ok(None);
+    };
+    let sessions = sessions
+        .try_read()
+        .map_err(|_| anyhow::anyhow!("Session map is busy; retry graph operation."))?;
+    let agent = sessions
+        .get(actor)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Actor is no longer initialized."))?
+        .try_lock_owned()
+        .map_err(|_| anyhow::anyhow!("Actor is busy; retry graph operation when idle."))?;
+    let members = members
+        .try_read()
+        .map_err(|_| anyhow::anyhow!("Member policy is busy; retry graph operation."))?;
+    let ancestry = super::swarm::trusted_swarm_ancestry(&members, actor)?;
+    let root = ancestry
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Missing trusted root"))?;
+    *routing = super::comm_control::observe_node_execution(
+        root,
+        actor,
+        routing,
+        pinned,
+        &agent,
+        &members,
+        provider.as_ref(),
+    )?;
+    Ok(Some(GraphActorGuard {
+        _agent: agent,
+        _members: members,
+        _sessions: sessions,
+    }))
+}
+
 pub(super) fn pin_graph_actor(
     graph: &mut TaskGraph,
     node_id: &str,
@@ -551,7 +605,7 @@ pub(super) async fn handle_comm_expand_node(
         err(client_event_tx, id, "No plan for this swarm.".into());
         return;
     };
-    let actor_routing = match validate_graph_actor(
+    let mut actor_routing = match validate_graph_actor(
         &req_session_id,
         &node_id,
         &admitted_plan,
@@ -611,6 +665,26 @@ pub(super) async fn handle_comm_expand_node(
             );
             return;
         }
+        let _execution_guard = match bind_graph_actor(
+            &req_session_id,
+            plan.node_meta
+                .get(&node_id)
+                .is_some_and(|meta| meta.resolved_execution.is_some()),
+            &mut actor_routing,
+            sessions,
+            swarm_members,
+            provider_template,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                err(
+                    client_event_tx,
+                    id,
+                    format!("Node execution rejected: {error}"),
+                );
+                return;
+            }
+        };
         let mut graph = to_task_graph(plan);
         let before = graph.clone();
         pin_graph_actor(&mut graph, &node_id, actor_routing.as_ref());
@@ -690,7 +764,7 @@ pub(super) async fn handle_comm_complete_node(
         err(client_event_tx, id, "No plan for this swarm.".into());
         return;
     };
-    let actor_routing = match validate_graph_actor(
+    let mut actor_routing = match validate_graph_actor(
         &req_session_id,
         &node_id,
         &admitted_plan,
@@ -724,6 +798,26 @@ pub(super) async fn handle_comm_complete_node(
             );
             return;
         }
+        let _execution_guard = match bind_graph_actor(
+            &req_session_id,
+            plan.node_meta
+                .get(&node_id)
+                .is_some_and(|meta| meta.resolved_execution.is_some()),
+            &mut actor_routing,
+            sessions,
+            swarm_members,
+            provider_template,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                err(
+                    client_event_tx,
+                    id,
+                    format!("Node execution rejected: {error}"),
+                );
+                return;
+            }
+        };
         let mut graph = to_task_graph(plan);
         pin_graph_actor(&mut graph, &node_id, actor_routing.as_ref());
         claim_queued_node_for_actor(&mut graph, &node_id, &req_session_id);
@@ -792,7 +886,7 @@ pub(super) async fn handle_comm_inject_gap(
         err(client_event_tx, id, "No plan for this swarm.".into());
         return;
     };
-    let actor_routing = match validate_graph_actor(
+    let mut actor_routing = match validate_graph_actor(
         &req_session_id,
         &gate_id,
         &admitted_plan,
@@ -852,6 +946,26 @@ pub(super) async fn handle_comm_inject_gap(
             );
             return;
         }
+        let _execution_guard = match bind_graph_actor(
+            &req_session_id,
+            plan.node_meta
+                .get(&gate_id)
+                .is_some_and(|meta| meta.resolved_execution.is_some()),
+            &mut actor_routing,
+            sessions,
+            swarm_members,
+            provider_template,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                err(
+                    client_event_tx,
+                    id,
+                    format!("Node execution rejected: {error}"),
+                );
+                return;
+            }
+        };
         let mut graph = to_task_graph(plan);
         let before = graph.clone();
         pin_graph_actor(&mut graph, &gate_id, actor_routing.as_ref());

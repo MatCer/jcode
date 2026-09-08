@@ -627,7 +627,7 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     } else {
         parsed.node_id.as_deref()
     };
-    let actor_routing = if parsed.op != "seed" {
+    let mut actor_routing = if parsed.op != "seed" {
         let Some(node_id) = node_id else {
             return fail("node_id/gate_id required");
         };
@@ -693,7 +693,6 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     let mut graph = to_task_graph(&staged_plan);
     let before = graph.clone();
     if let Some(node_id) = node_id {
-        super::comm_graph::pin_graph_actor(&mut graph, node_id, actor_routing.as_ref());
         super::comm_graph::claim_queued_node_for_actor(&mut graph, node_id, &actor);
     }
     let result = match parsed.op.as_str() {
@@ -717,12 +716,26 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
         }
         Ok(()) => {
             super::comm_graph::restrict_new_graph_nodes(&mut graph, &before, allowed.as_deref());
-            apply_task_graph(&mut staged_plan, &graph);
-            staged_plan.version += 1;
             let mut plans = ctx.swarm_plans.write().await;
             if plans.get(&swarm_id).map_or(0, |plan| plan.version) != admitted_plan.version {
                 return fail("Plan changed during admission; retry graph operation.");
             }
+            let _execution_guard = match super::comm_graph::bind_graph_actor(
+                &actor,
+                parent.resolved_execution.is_some(),
+                &mut actor_routing,
+                ctx.sessions,
+                ctx.swarm_members,
+                ctx.provider_template,
+            ) {
+                Ok(guard) => guard,
+                Err(error) => return fail(error),
+            };
+            if let Some(node_id) = node_id {
+                super::comm_graph::pin_graph_actor(&mut graph, node_id, actor_routing.as_ref());
+            }
+            apply_task_graph(&mut staged_plan, &graph);
+            staged_plan.version += 1;
             plans.insert(swarm_id.clone(), staged_plan);
             Ok((count, parsed.op.as_str()))
         }
