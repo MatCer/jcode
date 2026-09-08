@@ -940,7 +940,7 @@ pub(super) async fn handle_comm_list_models(
     };
     let actual_execution = match agent.as_ref() {
         Some(agent) => match agent.try_lock() {
-            Ok(agent) => observe_optional_swarm_execution(agent.provider_fork().as_ref()),
+            Ok(agent) => observe_optional_swarm_execution(agent.provider_handle().as_ref()),
             // A busy agent cannot attest current identity. Never use cached actual.
             Err(_) => None,
         },

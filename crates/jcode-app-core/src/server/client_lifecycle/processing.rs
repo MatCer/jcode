@@ -212,7 +212,7 @@ pub(in crate::server) async fn process_routed_message_streaming_mpsc(
                     // pass through current-policy validation below.
                     None => crate::protocol::SwarmRoutingStatus::default(),
                 };
-                let provider = agent.provider_fork();
+                let provider = agent.provider_handle();
                 crate::server::comm_control::observe_node_execution(
                     session_id, session_id, &routing, routing.resolved_execution.is_some(),
                     &agent, &members, provider.as_ref(),

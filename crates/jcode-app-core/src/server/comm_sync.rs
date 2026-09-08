@@ -302,7 +302,7 @@ pub(super) async fn handle_comm_status(
                         let mut routing = member.runtime.routing.clone().unwrap_or_default();
                         routing.actual_execution =
                             match super::comm_session::initialized_swarm_execution(
-                                agent.provider_fork().as_ref(),
+                                agent.provider_handle().as_ref(),
                             ) {
                                 Ok(actual) => Some(actual),
                                 Err(error) => {
@@ -474,7 +474,7 @@ pub(super) async fn handle_comm_plan_status(
         routing.actual_execution = agents.get(&session_id).and_then(|agent| {
             match agent.try_lock() {
                 Ok(agent) => match super::comm_session::initialized_swarm_execution(
-                    agent.provider_fork().as_ref(),
+                    agent.provider_handle().as_ref(),
                 ) {
                     Ok(actual) => Some(actual),
                     Err(error) => {

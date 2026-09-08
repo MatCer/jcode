@@ -165,7 +165,7 @@ pub(in crate::server) fn observe_node_execution(
     members: &HashMap<String, SwarmMember>,
     provider: &dyn crate::provider::Provider,
 ) -> anyhow::Result<SwarmRoutingStatus> {
-    let actual_provider = agent.provider_fork();
+    let actual_provider = agent.provider_handle();
     let actual =
         match crate::server::comm_session::initialized_swarm_execution(actual_provider.as_ref()) {
             Ok(actual) => Some(actual),

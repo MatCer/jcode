@@ -13,6 +13,7 @@ enum EffortSetter {
 struct EffortProvider {
     effort: std::sync::Mutex<Option<String>>,
     setter: EffortSetter,
+    reset_fork_effort: bool,
 }
 
 impl EffortProvider {
@@ -20,6 +21,7 @@ impl EffortProvider {
         Self {
             effort: std::sync::Mutex::new(effort.map(str::to_string)),
             setter,
+            reset_fork_effort: false,
         }
     }
 }
@@ -42,7 +44,14 @@ impl Provider for EffortProvider {
         "gpt-5.5".into()
     }
     fn fork(&self) -> Arc<dyn Provider> {
-        Arc::new(Self::new(self.reasoning_effort().as_deref(), self.setter))
+        let effort = if self.reset_fork_effort {
+            Some("low".to_string())
+        } else {
+            self.reasoning_effort()
+        };
+        let mut fork = Self::new(effort.as_deref(), self.setter);
+        fork.reset_fork_effort = self.reset_fork_effort;
+        Arc::new(fork)
     }
     fn model_routes(&self) -> Vec<crate::provider::ModelRoute> {
         routing_catalog()
@@ -360,21 +369,37 @@ async fn routing_pinned_effort_headless_rejection_has_no_orphan() {
 #[tokio::test]
 async fn routing_pinned_effort_spawn_none_does_not_apply_changed_config_default() {
     let env = EffortEnvironment::new("high");
-    for (pinned, actual, setter, configured) in [
-        (Some(pin(None)), None, EffortSetter::Apply, "high"),
-        (None, Some("medium"), EffortSetter::Noop, "high"),
-        (None, Some("medium"), EffortSetter::Unsupported, "high"),
-        (None, None, EffortSetter::Unsupported, "high"),
+    for (pinned, actual, setter, configured, reset_fork_effort) in [
+        (Some(pin(None)), None, EffortSetter::Apply, "high", false),
+        (None, Some("medium"), EffortSetter::Noop, "high", false),
+        (
+            None,
+            Some("medium"),
+            EffortSetter::Unsupported,
+            "high",
+            false,
+        ),
+        (None, None, EffortSetter::Unsupported, "high", false),
         (
             Some(pin(Some("high"))),
             Some("medium"),
             EffortSetter::Apply,
             "low",
+            false,
+        ),
+        (
+            Some(pin(Some("medium"))),
+            Some("low"),
+            EffortSetter::Apply,
+            "low",
+            true,
         ),
     ] {
         env.configure(configured);
         let expected = pinned.clone().unwrap_or_else(|| pin(actual));
-        let provider: Arc<dyn Provider> = Arc::new(EffortProvider::new(actual, setter));
+        let mut provider = EffortProvider::new(actual, setter);
+        provider.reset_fork_effort = reset_fork_effort;
+        let provider: Arc<dyn Provider> = Arc::new(provider);
         let sessions = Arc::new(RwLock::new(HashMap::new()));
         let global_id = Arc::new(RwLock::new(String::new()));
         let members = root_members();
@@ -429,7 +454,7 @@ async fn routing_pinned_effort_spawn_none_does_not_apply_changed_config_default(
             sessions.read().await[&result]
                 .lock()
                 .await
-                .provider_fork()
+                .provider_handle()
                 .reasoning_effort(),
             expected.effort
         );
@@ -440,4 +465,108 @@ async fn routing_pinned_effort_spawn_none_does_not_apply_changed_config_default(
             expected.effort
         );
     }
+}
+
+#[tokio::test]
+async fn routing_effort_startup_observes_initialized_provider_not_resetting_fork() {
+    let _env = EffortEnvironment::new("low");
+    for expected in ["medium", "low"] {
+        let mut provider = EffortProvider::new(Some("medium"), EffortSetter::Apply);
+        provider.reset_fork_effort = true;
+        let provider: Arc<dyn Provider> = Arc::new(provider);
+        let mut agent = Agent::new(provider.clone(), Registry::new(provider.clone()).await);
+        agent.set_reasoning_effort("medium").unwrap();
+        assert_eq!(
+            agent.provider_fork().reasoning_effort().as_deref(),
+            Some("low")
+        );
+        let id = agent.session_id().to_string();
+        let sessions = Arc::new(RwLock::new(HashMap::from([(
+            id.clone(),
+            Arc::new(Mutex::new(agent)),
+        )])));
+        let stored = SwarmRoutingStatus {
+            resolved_execution: Some(pin(Some(expected))),
+            ..Default::default()
+        };
+        let (mut worker, _rx) = member(&id, Some("s"), "agent");
+        worker.runtime.routing = Some(stored.clone());
+        let members = Arc::new(RwLock::new(HashMap::from([(id.clone(), worker)])));
+        let result =
+            routing::verify_swarm_session_startup(&id, &sessions, &members, &provider).await;
+        if expected == "medium" {
+            result.expect("startup must observe live medium, not the fork's default low");
+            assert_eq!(
+                members.read().await[&id]
+                    .runtime
+                    .routing
+                    .as_ref()
+                    .unwrap()
+                    .actual_execution,
+                Some(pin(Some("medium")))
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "actual medium must not pass a low pin just because its fork is low"
+            );
+            assert_eq!(members.read().await[&id].runtime.routing, Some(stored));
+        }
+        assert_eq!(provider.reasoning_effort().as_deref(), Some("medium"));
+    }
+}
+
+#[tokio::test]
+async fn routing_effort_startup_rechecks_identity_at_member_publication() {
+    let _env = EffortEnvironment::new("low");
+    let provider: Arc<dyn Provider> =
+        Arc::new(EffortProvider::new(Some("medium"), EffortSetter::Apply));
+    let mut agent = Agent::new(provider.clone(), Registry::new(provider.clone()).await);
+    agent.set_reasoning_effort("medium").unwrap();
+    let id = agent.session_id().to_string();
+    let agent = Arc::new(Mutex::new(agent));
+    let sessions = Arc::new(RwLock::new(HashMap::from([(id.clone(), agent.clone())])));
+    let stored = SwarmRoutingStatus {
+        resolved_execution: Some(pin(Some("medium"))),
+        ..Default::default()
+    };
+    let (mut worker, _rx) = member(&id, Some("s"), "agent");
+    worker.runtime.routing = Some(stored.clone());
+    let members = Arc::new(RwLock::new(HashMap::from([(id.clone(), worker)])));
+    let publication_barrier = members.read().await;
+    let task = {
+        let (id, sessions, members, provider) = (
+            id.clone(),
+            sessions.clone(),
+            members.clone(),
+            provider.clone(),
+        );
+        tokio::spawn(async move {
+            routing::verify_swarm_session_startup(&id, &sessions, &members, &provider).await
+        })
+    };
+    // Tokio's fair RwLock refuses new readers once the verifier queues its write.
+    // Hold publication there, change the live identity, then release the writer.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if members.try_read().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup must reach its member publication lock");
+    agent
+        .try_lock()
+        .expect("no agent lock held across member await")
+        .set_reasoning_effort("low")
+        .unwrap();
+    drop(publication_barrier);
+    let result = task.await.unwrap();
+    assert!(
+        result.is_err(),
+        "startup published stale medium after the initialized provider changed to low"
+    );
+    assert_eq!(members.read().await[&id].runtime.routing, Some(stored));
 }

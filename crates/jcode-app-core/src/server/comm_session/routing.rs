@@ -76,7 +76,7 @@ pub(in crate::server) async fn resolve_coordinator_spawn_identity(
         agent_sessions.get(req_session_id).cloned()
     } && let Ok(agent_guard) = agent.try_lock()
     {
-        if let Ok(actual) = initialized_swarm_execution(agent_guard.provider_fork().as_ref()) {
+        if let Ok(actual) = initialized_swarm_execution(agent_guard.provider_handle().as_ref()) {
             return CoordinatorSpawnIdentity {
                 model: Some(actual.model),
                 provider_key: Some(actual.provider_key),
@@ -767,22 +767,32 @@ pub(in crate::server) async fn verify_swarm_session_startup(
     members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     provider_template: &Arc<dyn Provider>,
 ) -> anyhow::Result<()> {
-    let Some(mut routing) = members
+    if members
         .read()
         .await
         .get(session_id)
-        .and_then(|m| m.runtime.routing.clone())
-    else {
+        .and_then(|m| m.runtime.routing.as_ref())
+        .is_none()
+    {
         return Ok(());
-    };
+    }
     let agent = sessions
         .read()
         .await
         .get(session_id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Prepared swarm session did not initialize."))?;
-    let provider = match agent.try_lock() {
-        Ok(agent) => agent.provider_fork(),
+    // Lock members before the nonblocking agent lock, then observe and publish
+    // synchronously. No provider identity or policy snapshot crosses an await.
+    let mut members = members.write().await;
+    let Some(mut routing) = members
+        .get(session_id)
+        .and_then(|m| m.runtime.routing.clone())
+    else {
+        return Ok(());
+    };
+    let agent_guard = match agent.try_lock() {
+        Ok(agent) => agent,
         Err(_) if routing.actual_execution.is_some() => return Ok(()),
         Err(_) => anyhow::bail!("Restored swarm session is busy before identity verification."),
     };
@@ -795,7 +805,7 @@ pub(in crate::server) async fn verify_swarm_session_startup(
         }
         let routes = provider_template.model_routes();
         routing.allowed_models = effective_swarm_allowed_models(
-            &*members.read().await,
+            &members,
             session_id,
             config
                 .swarm_model_selection
@@ -817,7 +827,10 @@ pub(in crate::server) async fn verify_swarm_session_startup(
         }
         routing.selection_enabled = Some(config.swarm_model_selection);
     }
-    routing.actual_execution = match routing.resolved_execution.as_ref() {
+    // Observe the initialized provider while its agent is locked. A fork may
+    // reconstruct provider defaults and is not evidence of this session's effort.
+    let provider = agent_guard.provider_handle();
+    let actual_execution = match routing.resolved_execution.as_ref() {
         Some(target) => Some(verify_swarm_execution(provider.as_ref(), target)?),
         None => {
             if routing
@@ -830,7 +843,8 @@ pub(in crate::server) async fn verify_swarm_session_startup(
             observe_optional_swarm_execution(provider.as_ref())
         }
     };
-    if let Some(member) = members.write().await.get_mut(session_id) {
+    routing.actual_execution = actual_execution;
+    if let Some(member) = members.get_mut(session_id) {
         member.runtime.routing = Some(routing);
     }
     Ok(())

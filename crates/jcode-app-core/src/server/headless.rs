@@ -259,7 +259,7 @@ pub(super) async fn create_routed_headless_session(
         // Capture inherited/unchangeable effort in the session too. Providers may
         // reject a redundant setter while already matching the durable pin.
         new_agent.restore_reasoning_effort_from_session();
-        let actual_provider = new_agent.provider_fork();
+        let actual_provider = new_agent.provider_handle();
         status.actual_execution = match status.resolved_execution.as_ref() {
             Some(target) => Some(super::comm_session::verify_swarm_execution(
                 actual_provider.as_ref(),
