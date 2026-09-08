@@ -417,6 +417,7 @@ pub(super) async fn handle_lightweight_control_request(
             spawn_mode,
             model,
             effort,
+            allowed_models,
             label,
         } => {
             let spawn_mode = match parse_swarm_spawn_mode(id, spawn_mode, &client_event_tx) {
@@ -432,6 +433,7 @@ pub(super) async fn handle_lightweight_control_request(
                 spawn_mode,
                 model,
                 effort,
+                allowed_models,
                 label,
                 &client_event_tx,
                 sessions,
@@ -457,9 +459,16 @@ pub(super) async fn handle_lightweight_control_request(
             id,
             session_id: req_session_id,
         } => {
-            handle_comm_list_models(id, &req_session_id, sessions, provider_template, |event| {
-                let _ = client_event_tx.send(event);
-            })
+            handle_comm_list_models(
+                id,
+                &req_session_id,
+                sessions,
+                provider_template,
+                swarm_members,
+                |event| {
+                    let _ = client_event_tx.send(event);
+                },
+            )
             .await;
         }
         Request::CommStop {
@@ -636,6 +645,8 @@ pub(super) async fn handle_lightweight_control_request(
             session_id: req_session_id,
             target_session,
             task_id,
+            model,
+            effort,
             message,
         } => {
             handle_comm_assign_task(
@@ -643,6 +654,8 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 target_session,
                 task_id,
+                model,
+                effort,
                 message,
                 &client_event_tx,
                 sessions,
@@ -669,6 +682,7 @@ pub(super) async fn handle_lightweight_control_request(
             message,
             model,
             effort,
+            allowed_models,
         } => {
             handle_comm_assign_next(
                 id,
@@ -680,6 +694,7 @@ pub(super) async fn handle_lightweight_control_request(
                 message,
                 model,
                 effort,
+                allowed_models,
                 &client_event_tx,
                 sessions,
                 global_session_id,

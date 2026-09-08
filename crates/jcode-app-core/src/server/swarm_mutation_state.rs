@@ -26,6 +26,8 @@ pub(crate) enum PersistedSwarmMutationResponse {
     },
     Spawn {
         new_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<crate::protocol::SwarmRoutingStatus>,
     },
 }
 
@@ -40,6 +42,7 @@ impl PersistedSwarmMutationResponse {
                 id,
                 task_id,
                 target_session,
+                routing: None,
             },
             Self::Error {
                 message,
@@ -49,10 +52,14 @@ impl PersistedSwarmMutationResponse {
                 message,
                 retry_after_secs,
             },
-            Self::Spawn { new_session_id } => ServerEvent::CommSpawnResponse {
+            Self::Spawn {
+                new_session_id,
+                routing,
+            } => ServerEvent::CommSpawnResponse {
                 id,
                 session_id: session_id.to_string(),
                 new_session_id,
+                routing,
             },
         }
     }
@@ -66,6 +73,8 @@ pub(crate) struct PersistedSwarmMutationState {
     pub created_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response: Option<PersistedSwarmMutationResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_request: Option<String>,
 }
 
 #[derive(Clone)]
@@ -97,6 +106,10 @@ pub(crate) struct SwarmMutationRuntime {
 }
 
 fn is_stale(state: &PersistedSwarmMutationState) -> bool {
+    // An explicit nonce is an idempotency key, not a 30-second hint.
+    if state.routing_request.is_some() {
+        return false;
+    }
     if state.final_response.is_some() {
         elapsed_exceeds(state.created_at_unix_ms, FINAL_STATE_TTL)
     } else {
@@ -109,16 +122,32 @@ pub(super) fn request_key(session_id: &str, action: &str, components: &[String])
 }
 
 pub(super) fn load_state(key: &str) -> Option<PersistedSwarmMutationState> {
-    load_json_state(SWARM_MUTATION_DIR, key, is_stale)
+    let mut state = load_json_state(SWARM_MUTATION_DIR, key, is_stale)?;
+    clear_persisted_actual_execution(&mut state);
+    Some(state)
 }
 
 pub(super) fn save_state(state: &PersistedSwarmMutationState) {
+    let mut durable = state.clone();
+    clear_persisted_actual_execution(&mut durable);
     save_json_state(
         SWARM_MUTATION_DIR,
         &state.key,
-        state,
+        &durable,
         "swarm mutation state",
     )
+}
+
+fn clear_persisted_actual_execution(state: &mut PersistedSwarmMutationState) {
+    if let Some(PersistedSwarmMutationResponse::Spawn {
+        routing: Some(routing),
+        ..
+    }) = state.final_response.as_mut()
+    {
+        // A disk replay knows the pinned target, not a currently initialized
+        // worker. The original in-memory response retains its verified actual.
+        routing.actual_execution = None;
+    }
 }
 
 pub(super) fn ensure_pending_state(
@@ -136,6 +165,7 @@ pub(super) fn ensure_pending_state(
         session_id: session_id.to_string(),
         created_at_unix_ms: now_unix_ms(),
         final_response: None,
+        routing_request: None,
     };
     save_state(&state);
     state
@@ -167,6 +197,28 @@ pub(super) async fn begin_or_replay(
         request_id,
         client_event_tx,
         true,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn begin_or_replay_routed_spawn(
+    runtime: &SwarmMutationRuntime,
+    key: &str,
+    routing_request: &str,
+    session_id: &str,
+    request_id: u64,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) -> Option<PersistedSwarmMutationState> {
+    begin_with_mode(
+        runtime,
+        key,
+        "spawn",
+        session_id,
+        request_id,
+        client_event_tx,
+        true,
+        Some(routing_request),
     )
     .await
 }
@@ -194,6 +246,7 @@ pub(super) async fn begin_or_join_in_flight(
         request_id,
         client_event_tx,
         false,
+        None,
     )
     .await
 }
@@ -206,6 +259,7 @@ async fn begin_with_mode(
     request_id: u64,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     replay_final: bool,
+    routing_request: Option<&str>,
 ) -> Option<PersistedSwarmMutationState> {
     {
         // Hold the sync lock across the persisted-final check, waiter
@@ -216,6 +270,20 @@ async fn begin_with_mode(
         // between the check and the claim, because finish drains/clears
         // under this same lock only after persisting the final state.
         let mut sync = runtime.sync.write().await;
+        if let Some(request) = routing_request {
+            let mut state = ensure_pending_state(key, action, session_id);
+            if state
+                .routing_request
+                .as_deref()
+                .is_some_and(|previous| previous != request)
+            {
+                let _ = client_event_tx.send(ServerEvent::Error { id: request_id,
+                    message: "The spawn request nonce was already used with conflicting routing (model, effort or allowed_models). Use a new nonce for a new worker.".into(), retry_after_secs: None });
+                return None;
+            }
+            state.routing_request = Some(request.to_string());
+            save_state(&state);
+        }
         if replay_final
             && let Some(final_response) = load_state(key).and_then(|state| state.final_response)
         {
@@ -245,6 +313,7 @@ async fn begin_with_mode(
             session_id: session_id.to_string(),
             created_at_unix_ms: now_unix_ms(),
             final_response: None,
+            routing_request: None,
         };
         save_state(&state);
         Some(state)

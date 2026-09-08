@@ -58,6 +58,7 @@ async fn swarm_mutation_replays_persisted_spawn_response() {
         &state,
         PersistedSwarmMutationResponse::Spawn {
             new_session_id: "child-1".to_string(),
+            routing: None,
         },
     )
     .await;
@@ -203,4 +204,81 @@ async fn control_driven_begin_coalesces_in_flight_duplicates() {
         ServerEvent::Done { id } => assert_eq!(id, 2),
         other => panic!("expected done, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn routing_nonce_conflict_survives_runtime_recreation() {
+    let (_env, _dir) = RuntimeEnvGuard::new();
+    let runtime = SwarmMutationRuntime::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let first = super::begin_or_replay_routed_spawn(&runtime, "nonce", "model-a", "coord", 1, &tx)
+        .await
+        .unwrap();
+    finish_request(
+        &runtime,
+        &first,
+        PersistedSwarmMutationResponse::Spawn {
+            new_session_id: "child".into(),
+            routing: None,
+        },
+    )
+    .await;
+    let _ = rx.recv().await;
+    let restarted = SwarmMutationRuntime::default();
+    assert!(
+        super::begin_or_replay_routed_spawn(&restarted, "nonce", "model-b", "coord", 2, &tx)
+            .await
+            .is_none()
+    );
+    assert!(
+        matches!(rx.recv().await, Some(ServerEvent::Error { message, .. }) if message.contains("conflicting routing"))
+    );
+}
+
+#[tokio::test]
+async fn routing_mutation_replay_does_not_claim_a_restored_actual_identity() {
+    let (_env, _dir) = RuntimeEnvGuard::new();
+    let runtime = SwarmMutationRuntime::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = begin_or_replay(&runtime, "actual-replay", "spawn", "coord", 1, &tx)
+        .await
+        .unwrap();
+    let target = jcode_plan::ResolvedExecution {
+        model: "gpt-5.5".into(),
+        provider_key: "openai-oauth".into(),
+        api_method: "openai-oauth".into(),
+        provider_label: "OpenAI".into(),
+        effort: Some("medium".into()),
+    };
+    finish_request(
+        &runtime,
+        &state,
+        PersistedSwarmMutationResponse::Spawn {
+            new_session_id: "child".into(),
+            routing: Some(crate::protocol::SwarmRoutingStatus {
+                resolved_execution: Some(target.clone()),
+                actual_execution: Some(target),
+                ..Default::default()
+            }),
+        },
+    )
+    .await;
+    assert!(
+        matches!(rx.recv().await, Some(ServerEvent::CommSpawnResponse { routing: Some(routing), .. }) if routing.actual_execution.is_some())
+    );
+    assert!(
+        begin_or_replay(
+            &SwarmMutationRuntime::default(),
+            "actual-replay",
+            "spawn",
+            "coord",
+            2,
+            &tx
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        matches!(rx.recv().await, Some(ServerEvent::CommSpawnResponse { routing: Some(routing), .. }) if routing.actual_execution.is_none() && routing.resolved_execution.is_some())
+    );
 }

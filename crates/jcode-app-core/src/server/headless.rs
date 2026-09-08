@@ -53,6 +53,49 @@ pub(super) async fn create_headless_session(
     report_back_to_session_id: Option<String>,
     memory_scope: HeadlessMemoryScope,
 ) -> Result<String> {
+    create_routed_headless_session(
+        sessions,
+        global_session_id,
+        provider_template,
+        command,
+        swarm_members,
+        swarms_by_id,
+        swarm_coordinators,
+        _swarm_plans,
+        soft_interrupt_queues,
+        selfdev_requested,
+        model_override,
+        provider_key_override,
+        route_api_method_override,
+        effort_override,
+        mcp_pool,
+        report_back_to_session_id,
+        memory_scope,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn create_routed_headless_session(
+    sessions: &SessionAgents,
+    global_session_id: &Arc<RwLock<String>>,
+    provider_template: &Arc<dyn Provider>,
+    command: &str,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
+    _swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    soft_interrupt_queues: &SessionInterruptQueues,
+    selfdev_requested: bool,
+    model_override: Option<String>,
+    provider_key_override: Option<String>,
+    route_api_method_override: Option<String>,
+    effort_override: Option<String>,
+    mcp_pool: Option<Arc<crate::mcp::SharedMcpPool>>,
+    report_back_to_session_id: Option<String>,
+    memory_scope: HeadlessMemoryScope,
+    mut routing: Option<crate::protocol::SwarmRoutingStatus>,
+) -> Result<String> {
     let memory_enabled = crate::config::config().features.memory;
     let swarm_enabled = crate::config::config().features.swarm;
 
@@ -68,6 +111,15 @@ pub(super) async fn create_headless_session(
     };
 
     let provider = provider_template.fork();
+    if let Some(status) = routing.as_ref() {
+        if let Some(target) = status.resolved_execution.as_ref() {
+            super::comm_session::initialize_swarm_provider(
+                provider.as_ref(),
+                target,
+                status.requested_effort.as_deref(),
+            )?;
+        }
+    }
     let registry = Registry::new(provider.clone()).await;
 
     if memory_scope == HeadlessMemoryScope::IsolatedTest {
@@ -111,7 +163,21 @@ pub(super) async fn create_headless_session(
     }
     let client_session_id = new_agent.session_id().to_string();
 
-    if let Some(model) = model_override {
+    if let Some(target) = routing.as_ref().and_then(|r| r.resolved_execution.as_ref()) {
+        let route = provider
+            .model_routes()
+            .into_iter()
+            .find(|route| {
+                route.model == target.model
+                    && route.api_method == target.api_method
+                    && route.provider == target.provider_label
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("Admitted swarm route missing during session initialization")
+            })?;
+        new_agent
+            .set_route_selection(&crate::provider::RouteSelection::from_model_route(&route))?;
+    } else if let Some(model) = model_override {
         // Build a model-switch request that preserves the coordinator's auth
         // route (e.g. claude-api vs claude-oauth, or an openai-compatible
         // profile) so the spawned headless agent reconstructs the exact
@@ -152,12 +218,38 @@ pub(super) async fn create_headless_session(
         .filter(|effort| !effort.is_empty())
         && let Err(e) = new_agent.set_reasoning_effort(effort)
     {
+        if routing
+            .as_ref()
+            .is_some_and(|r| r.requested_effort.is_some())
+        {
+            return Err(e);
+        }
         crate::logging::warn(&format!(
             "Failed to set headless session reasoning effort override '{}': {}",
             effort, e
         ));
     }
 
+    if let Some(status) = routing.as_mut() {
+        let actual_provider = new_agent.provider_fork();
+        status.actual_execution = match status.resolved_execution.as_ref() {
+            Some(target) => Some(super::comm_session::verify_swarm_execution(
+                actual_provider.as_ref(),
+                target,
+                status.requested_effort.as_deref(),
+            )?),
+            None => {
+                if let Some(effort) = status.requested_effort.as_deref() {
+                    if actual_provider.reasoning_effort().as_deref() != Some(effort.trim()) {
+                        anyhow::bail!(
+                            "Explicit swarm effort was not applied during initialization."
+                        );
+                    }
+                }
+                super::comm_session::initialized_swarm_execution(actual_provider.as_ref()).ok()
+            }
+        };
+    }
     new_agent.set_debug(true);
 
     if selfdev_requested {
@@ -252,6 +344,7 @@ pub(super) async fn create_headless_session(
                 task_label: None,
                 friendly_name: Some(friendly_name.clone()),
                 report_back_to_session_id: report_back_to_session_id.clone(),
+                allowed_models: routing.as_ref().and_then(|r| r.allowed_models.clone()),
                 latest_completion_report: None,
                 role: "agent".to_string(),
                 joined_at: now,
@@ -261,6 +354,7 @@ pub(super) async fn create_headless_session(
                 todo_progress: None,
                 todo_items: Vec::new(),
                 runtime: crate::protocol::SwarmMemberRuntime {
+                    routing,
                     model: Some(provider_model),
                     provider: Some(provider_name),
                     auth_method,

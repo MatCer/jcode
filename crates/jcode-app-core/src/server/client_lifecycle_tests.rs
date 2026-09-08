@@ -1018,6 +1018,7 @@ async fn client_initiated_turn_fans_out_stream_and_terminal_events_to_live_attac
             task_label: None,
             friendly_name: None,
             report_back_to_session_id: None,
+            allowed_models: None,
             latest_completion_report: None,
             role: "agent".to_string(),
             joined_at: Instant::now(),

@@ -85,6 +85,7 @@ fn persisted_swarm_state_round_trips_and_marks_running_stale() {
         detail: Some("writing tests".to_string()),
         friendly_name: Some("fox".to_string()),
         report_back_to_session_id: Some("session-2".to_string()),
+        allowed_models: None,
         latest_completion_report: None,
         role: "agent".to_string(),
         joined_at: Instant::now(),
@@ -160,6 +161,7 @@ fn ready_headless_member_with_report_stops_without_losing_report() {
         detail: None,
         friendly_name: Some("pig".to_string()),
         report_back_to_session_id: Some("session-coordinator".to_string()),
+        allowed_models: None,
         latest_completion_report: Some("Done. Built the worker; all tests pass.".to_string()),
         role: "agent".to_string(),
         joined_at: Instant::now(),
@@ -204,6 +206,7 @@ fn ready_detached_client_stops_on_reload_until_it_reattaches() {
         detail: None,
         friendly_name: Some("finch".to_string()),
         report_back_to_session_id: None,
+        allowed_models: None,
         latest_completion_report: None,
         role: "agent".to_string(),
         joined_at: Instant::now(),
@@ -290,6 +293,7 @@ fn terminal_member_retention_preserves_recent_reports_and_prunes_expired_records
         detail: Some("done".to_string()),
         friendly_name: Some("otter".to_string()),
         report_back_to_session_id: Some("session-coordinator".to_string()),
+        allowed_models: None,
         latest_completion_report: Some("All targeted tests passed.".to_string()),
         role: "agent".to_string(),
         joined_at: Instant::now(),
@@ -338,6 +342,7 @@ fn legacy_terminal_member_uses_snapshot_time_as_retention_fallback() {
         detail: Some("old failure".to_string()),
         friendly_name: Some("badger".to_string()),
         report_back_to_session_id: None,
+        allowed_models: None,
         latest_completion_report: Some("legacy report".to_string()),
         role: "agent".to_string(),
         joined_at: Instant::now(),
@@ -379,6 +384,7 @@ fn recovery_induced_terminal_status_starts_retention_at_load_time() {
         detail: None,
         friendly_name: Some("hare".to_string()),
         report_back_to_session_id: None,
+        allowed_models: None,
         latest_completion_report: Some("finished just before restart".to_string()),
         role: "agent".to_string(),
         joined_at: Instant::now(),
@@ -421,6 +427,7 @@ fn startup_gc_removes_expired_terminal_members_from_durable_snapshot() {
         detail: None,
         friendly_name: Some("fox".to_string()),
         report_back_to_session_id: None,
+        allowed_models: None,
         latest_completion_report: Some("report retained until expiry".to_string()),
         role: "agent".to_string(),
         joined_at: Instant::now(),
@@ -480,6 +487,9 @@ fn deep_plan_mode_and_node_meta_round_trip() {
     node_meta.insert(
         "root".to_string(),
         crate::plan::NodeMeta {
+            model: None,
+            effort: None,
+            resolved_execution: None,
             kind: Some("explore".to_string()),
             parent: None,
             expanded: true,
@@ -492,6 +502,9 @@ fn deep_plan_mode_and_node_meta_round_trip() {
     node_meta.insert(
         "root.gate".to_string(),
         crate::plan::NodeMeta {
+            model: None,
+            effort: None,
+            resolved_execution: None,
             kind: Some("critique".to_string()),
             parent: Some("root".to_string()),
             expanded: false,
@@ -611,6 +624,9 @@ fn gate_debt_and_artifact_hydration_survive_reload() {
     };
     let meta = |kind: &str, parent: Option<&str>, is_gate: bool, artifact: Option<&str>| {
         crate::plan::NodeMeta {
+            model: None,
+            effort: None,
+            resolved_execution: None,
             kind: Some(kind.to_string()),
             parent: parent.map(str::to_string),
             expanded: false,
@@ -1056,6 +1072,7 @@ fn persisted_swarm_state_without_plan_still_restores_coordinator_and_members() {
         detail: None,
         friendly_name: Some("owl".to_string()),
         report_back_to_session_id: None,
+        allowed_models: None,
         latest_completion_report: None,
         role: "coordinator".to_string(),
         joined_at: Instant::now(),
@@ -1229,4 +1246,49 @@ async fn stale_remove_cannot_delete_fresh_snapshot_or_restore_backup() {
         Some(&"coord-new".to_string()),
         "restart must restore the fresh incarnation, not its stale backup"
     );
+}
+
+#[test]
+fn routing_member_policy_json_and_hydration_preserve_absent_empty_and_narrowed() {
+    for allowed in [
+        None,
+        Some(vec![]),
+        Some(vec!["openai-oauth:gpt-5.5".to_string()]),
+    ] {
+        let payload = serde_json::json!({"session_id":"child", "working_dir":null,
+            "swarm_id":"routing-test", "swarm_enabled":true, "status":"ready",
+            "detail":null,"task_label":null,"friendly_name":null,
+            "report_back_to_session_id":"root", "latest_completion_report":null,
+            "role":"agent", "is_headless":true});
+        let mut record: SwarmMemberRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.allowed_models, None);
+        record.allowed_models = allowed.clone();
+        let record = serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut member = SwarmMember::from_record(record, tx);
+        let target = jcode_plan::ResolvedExecution {
+            model: "gpt-5.5".into(),
+            provider_key: "openai-oauth".into(),
+            api_method: "openai-oauth".into(),
+            provider_label: "OpenAI".into(),
+            effort: Some("medium".into()),
+        };
+        member.runtime.routing = Some(crate::protocol::SwarmRoutingStatus {
+            resolved_execution: Some(target.clone()),
+            actual_execution: Some(target.clone()),
+            ..Default::default()
+        });
+        assert_eq!(member.durable_record().allowed_models, allowed);
+        let dir = tempfile::TempDir::new().unwrap();
+        let _env = test_env(&dir);
+        persist_swarm_state("routing-test", None, Some("root"), &[member]);
+        let loaded = load_runtime_state();
+        let routing = loaded.members["child"].runtime.routing.as_ref().unwrap();
+        assert_eq!(routing.resolved_execution.as_ref(), Some(&target));
+        assert_eq!(routing.actual_execution, None);
+        assert_eq!(
+            loaded.members["child"].durable_record().allowed_models,
+            allowed
+        );
+    }
 }

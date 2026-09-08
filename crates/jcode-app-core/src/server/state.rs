@@ -212,6 +212,8 @@ pub struct SwarmMember {
     pub friendly_name: Option<String>,
     /// Session that should receive direct completion report-back for this member, if any.
     pub report_back_to_session_id: Option<String>,
+    /// Durable effective subtree restriction. Missing ancestry never relaxes it.
+    pub allowed_models: Option<Vec<String>>,
     /// Latest explicit completion report submitted by this member.
     pub latest_completion_report: Option<String>,
     /// Role: "agent" or "coordinator"
@@ -251,6 +253,7 @@ impl SwarmMember {
             task_label: self.task_label.clone(),
             friendly_name: self.friendly_name.clone(),
             report_back_to_session_id: self.report_back_to_session_id.clone(),
+            allowed_models: self.allowed_models.clone(),
             latest_completion_report: self.latest_completion_report.clone(),
             role: SwarmRole::from(self.role.clone()),
             is_headless: self.is_headless,
@@ -283,6 +286,7 @@ impl SwarmMember {
             task_label: record.task_label,
             friendly_name: record.friendly_name,
             report_back_to_session_id: record.report_back_to_session_id,
+            allowed_models: record.allowed_models,
             latest_completion_report: record.latest_completion_report,
             role: record.role.as_str().into_owned(),
             joined_at: Instant::now(),

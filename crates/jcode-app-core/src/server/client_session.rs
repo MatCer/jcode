@@ -396,6 +396,7 @@ async fn ensure_client_swarm_member(
                     task_label: None,
                     friendly_name: member_name.clone(),
                     report_back_to_session_id: None,
+                    allowed_models: None,
                     latest_completion_report: None,
                     role: "agent".to_string(),
                     joined_at: now,

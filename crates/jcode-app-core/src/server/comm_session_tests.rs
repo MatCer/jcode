@@ -61,6 +61,7 @@ fn member(
             detail: None,
             friendly_name: Some(session_id.to_string()),
             report_back_to_session_id: None,
+            allowed_models: None,
             latest_completion_report: None,
             role: role.to_string(),
             joined_at: Instant::now(),
@@ -1204,4 +1205,302 @@ fn swarm_spawn_effort_prefers_explicit_then_config_pin_then_inherit() {
     // With neither, the worker inherits the provider-wide effort.
     assert_eq!(resolve_swarm_spawn_effort(None, None), None);
     assert_eq!(resolve_swarm_spawn_effort(Some(""), Some("")), None);
+}
+
+fn routing_catalog() -> Vec<crate::provider::ModelRoute> {
+    [
+        ("gpt-5.5", "OpenAI", "openai-oauth", true),
+        ("gpt-5.5", "OpenAI", "openai-api-key", true),
+        ("claude-opus-4-8", "Anthropic", "claude-oauth", false),
+    ]
+    .into_iter()
+    .map(
+        |(model, provider, api_method, available)| crate::provider::ModelRoute {
+            model: model.into(),
+            provider: provider.into(),
+            api_method: api_method.into(),
+            available,
+            detail: String::new(),
+            cheapness: None,
+        },
+    )
+    .collect()
+}
+
+#[test]
+fn routing_admission_rejects_disabled_explicit_including_sentinels_and_blanks() {
+    for model in ["gpt-5.5", "inherit", "coordinator", " "] {
+        let error = crate::server::comm_session::admit_swarm_spawn_selection(
+            Some(model.into()),
+            None,
+            &coordinator_identity(Some("gpt-5.5"), Some("openai-oauth"), Some("openai-oauth")),
+            false,
+            None,
+            &routing_catalog(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("swarm_model_selection"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn routing_admission_rejects_ambiguity_unavailable_and_empty_policy() {
+    let coordinator =
+        coordinator_identity(Some("gpt-5.5"), Some("openai-oauth"), Some("openai-oauth"));
+    let error = crate::server::comm_session::admit_swarm_spawn_selection(
+        Some("gpt-5.5".into()),
+        None,
+        &coordinator,
+        true,
+        None,
+        &routing_catalog(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("openai-oauth:gpt-5.5"));
+    assert!(error.to_string().contains("openai-api:gpt-5.5"));
+    assert!(
+        crate::server::comm_session::admit_swarm_spawn_selection(
+            Some("claude-opus-4-8".into()),
+            None,
+            &coordinator,
+            true,
+            None,
+            &routing_catalog()
+        )
+        .is_err()
+    );
+    assert!(
+        crate::server::comm_session::admit_swarm_spawn_selection(
+            None,
+            None,
+            &coordinator,
+            true,
+            Some(&[]),
+            &routing_catalog()
+        )
+        .is_err()
+    );
+    assert!(
+        crate::server::comm_session::admit_swarm_spawn_selection(
+            Some(" ".into()),
+            None,
+            &coordinator,
+            true,
+            None,
+            &routing_catalog()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn routing_admission_pins_concrete_route_and_normalizes_allowlist_aliases() {
+    let coordinator =
+        coordinator_identity(Some("gpt-5.5"), Some("openai-oauth"), Some("openai-oauth"));
+    let admitted = crate::server::comm_session::admit_swarm_spawn_selection(
+        Some("openai-api:gpt-5.5".into()),
+        Some("inherit".into()),
+        &coordinator,
+        true,
+        Some(&["openai:gpt-5.5".into()]),
+        &routing_catalog(),
+    )
+    .unwrap();
+    assert_eq!(admitted.provider_key.as_deref(), Some("openai-api-key"));
+    let inherited = crate::server::comm_session::admit_swarm_spawn_selection(
+        Some("inherit".into()),
+        Some("openai-api:gpt-5.5".into()),
+        &coordinator,
+        true,
+        Some(&["gpt-5.5".into()]),
+        &routing_catalog(),
+    )
+    .unwrap();
+    assert_eq!(inherited.provider_key.as_deref(), Some("openai-oauth"));
+}
+
+#[test]
+fn routing_subtree_cannot_broaden_route_restriction() {
+    let inherited = vec!["openai-oauth:gpt-5.5".into()];
+    assert!(
+        crate::server::comm_session::narrow_swarm_allowed_models(
+            Some(&inherited),
+            Some(&["gpt-5.5".into()]),
+            &routing_catalog()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        crate::server::comm_session::narrow_swarm_allowed_models(
+            Some(&inherited),
+            Some(&[]),
+            &routing_catalog()
+        )
+        .unwrap(),
+        Some(vec![])
+    );
+}
+
+#[test]
+fn routing_trusted_ancestry_rejects_missing_parent_cross_swarm_and_cycle() {
+    let (mut child, _rx) = member("child", Some("s"), "coordinator");
+    child.report_back_to_session_id = Some("root".into());
+    let mut members = HashMap::from([("child".into(), child)]);
+    assert!(crate::server::swarm::trusted_swarm_ancestry(&members, "child").is_err());
+    let (root, _root_rx) = member("root", Some("other"), "coordinator");
+    members.insert("root".into(), root);
+    assert!(crate::server::swarm::trusted_swarm_ancestry(&members, "child").is_err());
+    members.get_mut("root").unwrap().swarm_id = Some("s".into());
+    assert_eq!(
+        crate::server::swarm::trusted_swarm_ancestry(&members, "child").unwrap(),
+        vec!["child", "root"]
+    );
+    members.get_mut("root").unwrap().report_back_to_session_id = Some("child".into());
+    assert!(crate::server::swarm::trusted_swarm_ancestry(&members, "child").is_err());
+}
+
+#[derive(Clone)]
+struct RoutingProbe {
+    api_key: bool,
+    effort: Option<String>,
+    fail_switch: bool,
+}
+#[async_trait]
+impl Provider for RoutingProbe {
+    async fn complete(
+        &self,
+        _: &[Message],
+        _: &[ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<EventStream> {
+        anyhow::bail!("no model requests in routing tests")
+    }
+    fn name(&self) -> &str {
+        "openai"
+    }
+    fn model(&self) -> String {
+        "gpt-5.5".into()
+    }
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+    fn model_routes(&self) -> Vec<crate::provider::ModelRoute> {
+        routing_catalog()
+    }
+    fn active_resolved_credential(&self) -> Option<jcode_provider_core::ResolvedCredential> {
+        Some(if self.api_key {
+            jcode_provider_core::ResolvedCredential::ApiKey
+        } else {
+            jcode_provider_core::ResolvedCredential::Oauth
+        })
+    }
+    fn set_model(&self, _: &str) -> Result<()> {
+        if self.fail_switch {
+            anyhow::bail!("route initialization failed")
+        }
+        Ok(())
+    }
+    fn reasoning_effort(&self) -> Option<String> {
+        self.effort.clone()
+    }
+    fn set_reasoning_effort(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn routing_initialized_identity_never_substitutes_requested_provider_or_effort() {
+    let actual = RoutingProbe {
+        api_key: true,
+        effort: Some("medium".into()),
+        fail_switch: false,
+    };
+    let mut expected = super::execution_for_route(&routing_catalog()[0], Some("high".into()));
+    let observed = super::initialized_swarm_execution(&actual).unwrap();
+    assert_eq!(observed.provider_key, "openai-api-key");
+    assert_eq!(observed.effort.as_deref(), Some("medium"));
+    assert!(super::verify_swarm_execution(&actual, &expected, None).is_err());
+    assert!(super::initialize_swarm_provider(&actual, &expected, None).is_err());
+    expected = super::execution_for_route(&routing_catalog()[1], Some("high".into()));
+    assert!(super::verify_swarm_execution(&actual, &expected, Some("high")).is_err());
+    assert!(super::initialize_swarm_provider(&actual, &expected, Some("high")).is_err());
+    assert!(super::verify_swarm_execution(&actual, &expected, Some("medium")).is_ok());
+    let failing = RoutingProbe {
+        fail_switch: true,
+        ..actual
+    };
+    assert!(super::initialize_swarm_provider(&failing, &expected, None).is_err());
+}
+
+#[test]
+fn routing_current_operator_tightening_intersects_durable_ancestry() {
+    let (mut root, _rx) = member("root", Some("s"), "coordinator");
+    root.allowed_models = Some(vec!["gpt-5.5".into()]);
+    let (mut child, _rx2) = member("child", Some("s"), "agent");
+    child.report_back_to_session_id = Some("root".into());
+    child.allowed_models = Some(vec!["openai-oauth:gpt-5.5".into()]);
+    let members = HashMap::from([("root".into(), root), ("child".into(), child)]);
+    let allowed = super::effective_swarm_allowed_models(
+        &members,
+        "child",
+        Some(&[]),
+        None,
+        &routing_catalog(),
+    )
+    .unwrap();
+    assert_eq!(allowed, Some(vec![]));
+    assert!(
+        super::effective_swarm_allowed_models(
+            &members,
+            "child",
+            None,
+            Some(&["gpt-5.5".into()]),
+            &routing_catalog()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn routing_disabled_omission_preserves_legacy_pin_and_inheritance() {
+    let identity = coordinator_identity(Some("custom"), Some("custom-provider"), None);
+    let inherited =
+        super::admit_swarm_spawn_selection(None, None, &identity, false, None, &[]).unwrap();
+    assert_eq!(inherited.model.as_deref(), Some("custom"));
+    let pinned = super::admit_swarm_spawn_selection(
+        None,
+        Some("openai-api:gpt-5.5".into()),
+        &identity,
+        false,
+        None,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(pinned.provider_key.as_deref(), Some("openai-api-key"));
+}
+
+#[test]
+fn routing_policy_projection_never_broadens_a_lossy_catalog_selector() {
+    let mut routes = routing_catalog();
+    routes.push(crate::provider::ModelRoute {
+        model: "gpt-5.5".into(),
+        provider: "Jcode".into(),
+        api_method: "jcode-subscription".into(),
+        available: true,
+        detail: String::new(),
+        cheapness: None,
+    });
+    let (mut root, _rx) = member("root", Some("s"), "coordinator");
+    root.allowed_models = Some(vec!["openai-oauth:gpt-5.5".into()]);
+    let members = HashMap::from([("root".into(), root)]);
+    let allowed = super::effective_swarm_allowed_models(&members, "root", None, None, &routes)
+        .unwrap()
+        .unwrap();
+    assert_eq!(allowed, vec!["openai-oauth:gpt-5.5"]);
+    assert!(!super::permitted_route(&routes[1], Some(&allowed)));
+    assert!(!super::permitted_route(&routes[3], Some(&allowed)));
 }

@@ -1639,6 +1639,15 @@ pub(super) async fn handle_client(
                             ),
                         )
                         .await?;
+                        if let Err(error) = super::comm_session::verify_swarm_session_startup(&client_session_id, &sessions, &swarm_members, &provider_template).await {
+                            if let Some(member) = swarm_members.write().await.get_mut(&client_session_id) {
+                                member.status = "failed".into(); member.detail = Some(error.to_string());
+                                if let Some(routing) = member.runtime.routing.as_mut() { routing.actual_execution = None; }
+                            }
+                            let _ = client_event_tx.send(ServerEvent::Error { id, message: error.to_string(), retry_after_secs: None });
+                            break;
+                        }
+
                         session_control = refresh_session_control_handle(
                             &client_session_id,
                             &agent,
@@ -1888,6 +1897,15 @@ pub(super) async fn handle_client(
                     ),
                 )
                 .await?;
+                        if let Err(error) = super::comm_session::verify_swarm_session_startup(&client_session_id, &sessions, &swarm_members, &provider_template).await {
+                            if let Some(member) = swarm_members.write().await.get_mut(&client_session_id) {
+                                member.status = "failed".into(); member.detail = Some(error.to_string());
+                                if let Some(routing) = member.runtime.routing.as_mut() { routing.actual_execution = None; }
+                            }
+                            let _ = client_event_tx.send(ServerEvent::Error { id, message: error.to_string(), retry_after_secs: None });
+                            break;
+                        }
+
                 if client_session_id != pre_resume_session_id {
                     provisional_session = false;
                 }
@@ -2519,6 +2537,7 @@ pub(super) async fn handle_client(
                 spawn_mode,
                 model,
                 effort,
+            allowed_models,
                 label,
             } => {
                 let spawn_mode = match parse_swarm_spawn_mode(id, spawn_mode, &client_event_tx) {
@@ -2534,6 +2553,7 @@ pub(super) async fn handle_client(
                     spawn_mode,
                     model,
                     effort,
+            allowed_models,
                     label,
                     &client_event_tx,
                     &sessions,
@@ -2565,6 +2585,7 @@ pub(super) async fn handle_client(
                     &req_session_id,
                     &sessions,
                     &provider_template,
+                        &swarm_members,
                     |event| {
                         let _ = client_event_tx.send(event);
                     },
@@ -2754,6 +2775,8 @@ pub(super) async fn handle_client(
                 session_id: req_session_id,
                 target_session,
                 task_id,
+            model,
+            effort,
                 message,
             } => {
                 handle_comm_assign_task(
@@ -2761,6 +2784,8 @@ pub(super) async fn handle_client(
                     req_session_id,
                     target_session,
                     task_id,
+            model,
+            effort,
                     message,
                     &client_event_tx,
                     &sessions,
@@ -2788,6 +2813,7 @@ pub(super) async fn handle_client(
                 message,
                 model,
                 effort,
+            allowed_models,
             } => {
                 handle_comm_assign_next(
                     id,
@@ -2799,6 +2825,7 @@ pub(super) async fn handle_client(
                     message,
                     model,
                     effort,
+            allowed_models,
                     &client_event_tx,
                     &sessions,
                     &global_session_id,

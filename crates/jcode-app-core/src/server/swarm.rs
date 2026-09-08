@@ -38,6 +38,36 @@ pub(super) use jcode_swarm_core::MAX_SWARM_MEMBERS;
 /// spawned by `P` reports back to `P`. Walking that chain reconstructs the spawn
 /// tree without persisting a separate parent field. Cycles (which should never
 /// happen) are guarded against with a visited set.
+pub(super) fn trusted_swarm_ancestry(
+    members: &HashMap<String, SwarmMember>,
+    session_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let swarm = members
+        .get(session_id)
+        .and_then(|m| m.swarm_id.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Missing trusted swarm member '{session_id}'."))?;
+    let mut ancestry = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = session_id;
+    loop {
+        if !seen.insert(current.to_string()) {
+            anyhow::bail!("Cycle in trusted swarm ancestry.");
+        }
+        let member = members.get(current).ok_or_else(|| {
+            anyhow::anyhow!("Missing trusted swarm ancestor '{current}'; routing denied.")
+        })?;
+        if member.swarm_id.as_deref() != Some(swarm) {
+            anyhow::bail!("Swarm ancestry crosses a swarm boundary.");
+        }
+        ancestry.push(current.to_string());
+        match member.report_back_to_session_id.as_deref() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    Ok(ancestry)
+}
+
 pub(super) fn swarm_ancestors(
     members: &HashMap<String, SwarmMember>,
     session_id: &str,
@@ -713,6 +743,7 @@ async fn broadcast_swarm_status_now(
                     todo_progress: m.todo_progress,
                     todo_items: m.todo_items.clone(),
                     runtime: crate::protocol::SwarmMemberRuntime {
+                        routing: m.runtime.routing.clone(),
                         model: m.runtime.model.clone(),
                         provider: m.runtime.provider.clone(),
                         auth_method: m.runtime.auth_method.clone(),
@@ -1821,6 +1852,7 @@ mod tests {
                 task_label: None,
                 friendly_name: Some(session_id.to_string()),
                 report_back_to_session_id: None,
+                allowed_models: None,
                 latest_completion_report: None,
                 role: role.to_string(),
                 joined_at: Instant::now(),

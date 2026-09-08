@@ -133,6 +133,8 @@ fn is_light_mode(mode: &str) -> bool {
 struct PersistedSwarmMember {
     #[serde(flatten)]
     record: SwarmMemberRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routing: Option<crate::protocol::SwarmRoutingStatus>,
     /// Wall-clock time when the member entered its current terminal status.
     /// Legacy snapshots omit this; their snapshot timestamp becomes the
     /// conservative migration fallback so reports are not discarded eagerly.
@@ -327,6 +329,10 @@ fn to_persisted_member(member: &SwarmMember, snapshot_unix_ms: u64) -> Persisted
         });
     PersistedSwarmMember {
         record: member.durable_record(),
+        routing: member.runtime.routing.clone().map(|mut routing| {
+            routing.actual_execution = None;
+            routing
+        }),
         terminal_since_unix_ms,
     }
 }
@@ -431,6 +437,10 @@ fn from_persisted_member(
         },
         recovered_member_event_tx(),
     );
+    recovered.runtime.routing = member.routing.map(|mut routing| {
+        routing.actual_execution = None;
+        routing
+    });
     if let Some(terminal_since) = terminal_since_unix_ms {
         let terminal_age = Duration::from_millis(loaded_at_unix_ms.saturating_sub(terminal_since));
         recovered.last_status_change = Instant::now()
