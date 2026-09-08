@@ -42,6 +42,13 @@ never a client-side unconstrained spawn/reassignment pair. An exact id must exis
 and be runnable/unassigned before spawning. No compatible worker with spawning
 disabled is a routing-blocked error, not an empty queue or successful progress.
 
+For `assign_task` and `assign_next`, `task_id` selects an exact node. Omit it to
+select the next runnable task. `spawn_if_needed` enables compatible-worker
+spawning for `assign_task`, `assign_next`, `fill_slots`, and `run_plan` when no
+compatible reusable worker is available. `prefer_spawn` prefers a fresh worker
+over reuse. Call-level `model` and `effort` constrain reused workers too, and
+cannot override an authoritative node choice.
+
 The first assignment pins concrete model, provider key, API method and actual
 effort. Retry, reassign, replace, resume, composite synthesis re-wake and durable
 restore retain the pin. Tightened operator policy can block a retry. It cannot

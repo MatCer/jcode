@@ -2007,11 +2007,11 @@ impl Tool for CommunicateTool {
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Optional plan task ID. assign_task/assign_next can select an exact node; automatic spawning requires it to be runnable and unassigned. Omit for the next runnable task."
+                    "description": "Optional exact task ID for assignment. Omit for the next runnable task."
                 },
                 "spawn_if_needed": {
                     "type": "boolean",
-                    "description": "For assign_task/assign_next/fill_slots/run_plan: spawn a compatible agent when no reusable one is available."
+                    "description": "For assignment or plan execution: spawn if no compatible worker is reusable."
                 },
                 "prefer_spawn": {
                     "type": "boolean",
@@ -2024,17 +2024,17 @@ impl Tool for CommunicateTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model constraint for spawn/assignment (including reuse), requiring agents.swarm_model_selection=true (default off), e.g. 'gpt-6-astra' or 'openai-api:gpt-5.6-luna'. Overrides agents.swarm_model. Omit to use that default or inherit the coordinator if unset. Use 'inherit' to force the coordinator's model and route. Blank is an error. Node choices are authoritative; conflicting assignments fail. Reused workers must match. See list_models for effective policy."
+                    "description": "Optional model. Requires agents.swarm_model_selection=true. See list_models for policy/routes."
                 },
                 "allowed_models": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "For spawn/assignment: narrower subtree model selectors. Omit to inherit, empty [] denies new execution. Cannot broaden trusted ancestry/operator restrictions."
+                    "description": "Narrow subtree models only. Omit to inherit restrictions, empty [] denies new execution."
                 },
                 "effort": {
                     "type": "string",
                     "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-                    "description": "Optional reasoning effort constraint for spawned/reused workers. Omit for existing defaults. Blank or unsupported explicit effort fails; node conflicts fail."
+                    "description": "Optional worker effort constraint, including reuse. Unsupported values and node conflicts fail."
                 },
                 "session_ids": {
                     "type": "array",
@@ -2119,7 +2119,7 @@ impl Tool for CommunicateTool {
                 "nodes".to_string(),
                 json!({
                     "type": "array",
-                    "description": "Node specs for task_graph/expand_node/inject_gap. Explicit model requires operator opt-in. Nodes inherit trusted subtree restrictions.",
+                    "description": "Node specs for task_graph/expand_node/inject_gap. Inherit trusted subtree restrictions.",
                     "items": {
                         "type": "object",
                         "required": ["id", "content"],
@@ -2129,7 +2129,7 @@ impl Tool for CommunicateTool {
                             "kind": {"type": "string"},
                             "depends_on": {"type": "array", "items": {"type": "string"}},
                             "priority": {"type": "integer"},
-                            "model": {"type": "string", "description": "Optional authoritative node model; requires agents.swarm_model_selection. Blank is an error. Use a route from list_models."},
+                            "model": {"type": "string", "description": "Optional authoritative node model. Requires agents.swarm_model_selection=true."},
                             "effort": {"type": "string", "description": "Optional authoritative node effort. Blank/unsupported values fail; retry retains concrete execution."}
                         },
                         "additionalProperties": false
@@ -3096,7 +3096,6 @@ impl Tool for CommunicateTool {
                         Ok(ServerEvent::CommAssignTaskResponse {
                             task_id,
                             target_session,
-                            routing,
                             ..
                         }) => assignments.push(format!("{} -> {}", task_id, target_session)),
                         Ok(ServerEvent::Error { message, .. })

@@ -1949,6 +1949,32 @@ fn routing_schema_documents_opt_in_and_node_constraints() {
 }
 
 #[test]
+fn routing_parameter_descriptions_stay_under_token_cap() {
+    let schema = CommunicateTool::new().parameters_schema();
+    for (path, expected_type) in [
+        ("/properties/allowed_models", "array"),
+        ("/properties/effort", "string"),
+        ("/properties/model", "string"),
+        ("/properties/nodes", "array"),
+        ("/properties/nodes/items/properties/model", "string"),
+        ("/properties/nodes/items/properties/effort", "string"),
+        ("/properties/prefer_spawn", "boolean"),
+        ("/properties/spawn_if_needed", "boolean"),
+        ("/properties/task_id", "string"),
+    ] {
+        let property = schema
+            .pointer(path)
+            .expect("routing field must remain public");
+        assert_eq!(property["type"], expected_type, "{path}");
+        let description = property["description"]
+            .as_str()
+            .expect("routing field must retain actionable guidance");
+        let tokens = crate::util::estimate_tokens(description);
+        assert!(tokens <= 25, "{path}: {tokens} tokens: {description}");
+    }
+}
+
+#[test]
 fn routing_blocked_is_fatal_even_when_wrapping_legacy_no_workers_or_no_work() {
     for reason in [
         "No ready or completed swarm agents",
@@ -2210,6 +2236,7 @@ async fn routing_public_tool_exact_node_spawn_status_policy_and_driver_failures(
     );
     // The provider double finishes asynchronously. Once its lock is released,
     // status must return a fresh observation, not stay permanently unknown.
+    let mut last_status = String::new();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let idle = tool
@@ -2224,11 +2251,14 @@ async fn routing_public_tool_exact_node_spawn_status_policy_and_driver_failures(
             ) {
                 break;
             }
+            last_status = idle.output;
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("idle worker must expose fresh actual execution");
+    .unwrap_or_else(|error| {
+        panic!("idle worker must expose fresh actual execution: {error}\n{last_status}")
+    });
     let saved = crate::session::Session::load_startup_stub(worker).unwrap();
     assert_eq!(saved.parent_id.as_deref(), Some(coord.as_str()));
     assert_eq!(saved.model.as_deref(), Some("gpt-5.6-sol"));
