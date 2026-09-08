@@ -12,6 +12,13 @@ fn default_true() -> bool {
 /// protocol stays self-describing and serde-stable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskGraphNodeSpec {
+    /// Explicit requested selector. Blank is invalid: omit the field for defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Explicit requested effort, independent of model selection. Blank is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+
     pub id: String,
     pub content: String,
     /// "explore" | "implement" | "verify" | "fix" | "synthesize". Defaults to
@@ -548,7 +555,9 @@ pub enum Request {
         request_nonce: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawn_mode: Option<String>,
-        /// Optional per-spawn model override. Takes precedence over
+        /// Optional per-spawn model override, requiring operator opt-in.
+        /// Blank explicit model/effort must be rejected with an actionable error,
+        /// not treated as omission. Takes precedence over
         /// `agents.swarm_model` config. Supports explicit auth-route prefixes
         /// (e.g. `openai-api:gpt-5.5`) and the `inherit`/`coordinator`
         /// sentinels to force coordinator inheritance past a config pin.
@@ -558,6 +567,11 @@ pub enum Request {
         /// `low`, `medium`, `high`, `xhigh`, `max`). Unset = provider default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Optional narrower subtree selectors. None inherits all restrictions;
+        /// Some([]) denies execution. Server must reject broadening, persist the
+        /// effective restriction with trusted ancestry, and validate defaults too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_models: Option<Vec<String>>,
         /// Optional short human-readable label for the spawned agent shown in
         /// swarm UI (gallery chips, member lists). Overrides the task label
         /// otherwise derived from the first line of `initial_message`.
@@ -655,6 +669,12 @@ pub enum Request {
         task_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Assignment constraints, not edits to persisted node choices. Conflicts
+        /// must be rejected for both explicit targets and newly spawned workers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
 
     /// Assign the next runnable unassigned task from the plan (coordinator only)
@@ -672,12 +692,17 @@ pub enum Request {
         spawn_if_needed: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
-        /// Optional model override for workers spawned by this assignment
-        /// (same semantics as CommSpawn::model).
+        /// Optional narrowing for a newly spawned worker subtree, as in CommSpawn.
+        /// Existing targets must satisfy this restriction too, never bypass it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_models: Option<Vec<String>>,
+        /// Optional assignment model constraint (same selectors as CommSpawn).
+        /// Reused and spawned workers must match. A conflicting persisted node
+        /// choice must be rejected, not silently changed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
-        /// Optional reasoning effort for workers spawned by this assignment
-        /// (same semantics as CommSpawn::effort).
+        /// Optional assignment effort constraint, applied to reused and spawned
+        /// workers without changing the persisted node requirement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
@@ -1383,6 +1408,9 @@ pub enum ServerEvent {
         id: u64,
         task_id: String,
         target_session: String,
+        /// Server-reported requested/actual execution and current policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<SwarmRoutingStatus>,
     },
 
     /// Response to comm_task_control request
@@ -1395,6 +1423,9 @@ pub enum ServerEvent {
         target_session: Option<String>,
         status: String,
         summary: PlanGraphStatus,
+        /// Server-reported requested/actual execution and current policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<SwarmRoutingStatus>,
     },
 
     /// Response to comm_read_context request
@@ -1411,6 +1442,9 @@ pub enum ServerEvent {
         id: u64,
         session_id: String,
         new_session_id: String,
+        /// Server-reported requested/actual execution and current policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<SwarmRoutingStatus>,
     },
 
     /// Response to comm_list_models request
@@ -1428,6 +1462,9 @@ pub enum ServerEvent {
         /// method + availability + rough cost estimate).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         model_routes: Vec<jcode_provider_core::ModelRoute>,
+        /// Server-reported requested/actual execution and current policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<SwarmRoutingStatus>,
     },
 
     /// Response to comm_await_members request

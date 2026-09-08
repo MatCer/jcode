@@ -16,6 +16,7 @@ fn test_swarm_plan_event_roundtrip_with_summary() -> Result<()> {
         participants: vec!["session_fox".to_string()],
         reason: Some("task_completed".to_string()),
         summary: Some(PlanGraphStatus {
+            node_routing: BTreeMap::new(),
             swarm_id: Some("swarm_123".to_string()),
             version: 7,
             item_count: 1,
@@ -46,6 +47,7 @@ fn test_swarm_plan_event_roundtrip_with_summary() -> Result<()> {
         participants,
         reason,
         summary,
+        ..
     } = decoded
     else {
         return Err(anyhow!("expected SwarmPlan event"));
@@ -64,12 +66,14 @@ fn test_swarm_plan_event_roundtrip_with_summary() -> Result<()> {
 #[test]
 fn test_comm_task_control_response_roundtrip() -> Result<()> {
     let event = ServerEvent::CommTaskControlResponse {
+        routing: None,
         id: 61,
         action: "start".to_string(),
         task_id: "task-1".to_string(),
         target_session: Some("sess_worker".to_string()),
         status: "running".to_string(),
         summary: PlanGraphStatus {
+            node_routing: BTreeMap::new(),
             swarm_id: Some("swarm_123".to_string()),
             version: 3,
             item_count: 2,
@@ -99,6 +103,7 @@ fn test_comm_task_control_response_roundtrip() -> Result<()> {
         target_session,
         status,
         summary,
+        ..
     } = decoded
     else {
         return Err(anyhow!("expected CommTaskControlResponse"));
@@ -221,6 +226,7 @@ fn test_comm_status_response_roundtrip() -> Result<()> {
     let event = ServerEvent::CommStatusResponse {
         id: 57,
         snapshot: AgentStatusSnapshot {
+            routing: None,
             session_id: "sess-peer".to_string(),
             friendly_name: Some("bear".to_string()),
             swarm_id: Some("swarm-test".to_string()),

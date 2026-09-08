@@ -113,6 +113,9 @@ pub fn to_task_graph(plan: &VersionedPlan) -> TaskGraph {
             priority: crate::priority_rank(&item.priority),
             output: artifact,
             origin: parse_origin(meta.origin.as_deref()),
+            model: meta.model,
+            effort: meta.effort,
+            resolved_execution: meta.resolved_execution,
         });
     }
     graph
@@ -151,6 +154,9 @@ pub fn apply_task_graph(plan: &mut VersionedPlan, graph: &TaskGraph) {
         node_meta.insert(
             node.id.clone(),
             NodeMeta {
+                model: node.model.clone(),
+                effort: node.effort.clone(),
+                resolved_execution: node.resolved_execution.clone(),
                 kind: Some(kind_str(node.kind).to_string()),
                 parent: node.parent.clone(),
                 expanded: node.expanded,
@@ -499,5 +505,41 @@ mod tests {
         );
         // dep is not completed, so no context is injected.
         assert_eq!(upstream_context(&plan, "task"), None);
+    }
+    #[test]
+    fn routing_bridge_and_persisted_metadata_keep_full_execution() {
+        let execution = serde_json::json!({
+            "model":"gpt-6-astra", "provider_key":"openai-oauth",
+            "api_method":"OpenAI OAuth", "provider_label":"OpenAI", "effort":"high"
+        });
+        let metadata = serde_json::json!({
+            "kind":"implement", "model":"openai-oauth:gpt-6-astra", "effort":"high",
+            "resolved_execution":execution
+        });
+        let mut plan = VersionedPlan::default();
+        let mut graph = TaskGraph::new(Mode::Light);
+        crate::dag::seed(
+            &mut graph,
+            vec![crate::dag::NodeSpec::new("r", "work", NodeKind::Implement)],
+        )
+        .unwrap();
+        apply_task_graph(&mut plan, &graph);
+        plan.node_meta.insert(
+            "r".into(),
+            serde_json::from_value(metadata.clone()).unwrap(),
+        );
+        let lifted = to_task_graph(&plan);
+        let node = serde_json::to_value(lifted.get("r").unwrap()).unwrap();
+        assert_eq!(node["resolved_execution"], metadata["resolved_execution"]);
+        apply_task_graph(&mut plan, &lifted);
+        let serialized = serde_json::to_vec(&plan.node_meta).unwrap();
+        plan.node_meta = serde_json::from_slice(&serialized).unwrap();
+        let roundtrip = serde_json::to_value(&plan.node_meta["r"]).unwrap();
+        for field in ["model", "effort", "resolved_execution"] {
+            assert_eq!(roundtrip[field], metadata[field]);
+        }
+        assert_eq!(to_task_graph(&plan).get("r"), lifted.get("r"));
+        let old: NodeMeta = serde_json::from_str("{}").unwrap();
+        assert_eq!(old, NodeMeta::default());
     }
 }

@@ -109,12 +109,42 @@ pub struct SwarmExecutionState {
     pub items: Vec<SwarmExecutionItemState>,
 }
 
+/// Concrete execution identity selected by the server at first dispatch.
+///
+/// Data-only adapter for provider-core's `RouteSelection`, not another resolver.
+/// `provider_key` is `RouteSelection.runtime_key.stable_id()` (including compatible
+/// profile ids), `api_method` and `provider_label` are copied verbatim from that
+/// selection. The server must reconstruct/validate the route against its catalog,
+/// never infer provider identity from model equivalence alone. `effort` records
+/// the concrete execution setting, not the original effort request. None means
+/// no known setting. This pinned target alone is not evidence of initialization:
+/// only report actual execution after checking the initialized session identity.
+/// Persist this through retries/replacement/resume and revalidate current policy
+/// before new execution. Untrusted node specs must not supply this record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedExecution {
+    pub model: String,
+    pub provider_key: String,
+    pub api_method: String,
+    pub provider_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
 /// Per-node task-DAG metadata, stored as a side map on `VersionedPlan` keyed by
 /// plan item id. This mirrors the `task_progress` side-map pattern so existing
 /// `PlanItem` construction sites stay unchanged while the DAG engine gains the
 /// extra structure it needs (composite/gate mechanics + typed artifacts).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeMeta {
+    /// Original explicit selector. None keeps configured/inherited selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Original explicit effort, separate from the effective execution setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_execution: Option<ResolvedExecution>,
     /// Terminal-action kind: "explore" | "implement" | "verify" | "fix" |
     /// "synthesize" | "critique". Defaults to a plain task when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]

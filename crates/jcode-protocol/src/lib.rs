@@ -275,9 +275,36 @@ pub struct AgentInfo {
     pub todos_total: Option<usize>,
 }
 
+/// Server-produced routing status. Never used as caller authorization or as the
+/// durable source of truth. Missing fields mean unknown/not requested, not a
+/// successful application of a requested value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmRoutingStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_effort: Option<String>,
+    /// Pinned execution target from durable node metadata. Selection alone does
+    /// not prove that a worker initialized or that explicit effort was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_execution: Option<jcode_plan::ResolvedExecution>,
+    /// Actual identity/settings, populated only from a verified initialized
+    /// session. Never synthesize this from the request or pinned plan target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_execution: Option<jcode_plan::ResolvedExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_enabled: Option<bool>,
+    /// Effective current operator + ancestry restriction, not just a local pin.
+    /// None adds no restriction, Some([]) denies all new execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
+}
+
 /// Lightweight status snapshot for a swarm member.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStatusSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<SwarmRoutingStatus>,
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub friendly_name: Option<String>,
@@ -314,6 +341,11 @@ pub struct AgentStatusSnapshot {
 /// Lightweight swarm plan graph summary for planner-friendly reads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanGraphStatus {
+    /// Requested/pinned execution keyed by node id, including pending requests.
+    /// The plan projection populates durable targets only. The server may add
+    /// verified actual execution and current policy from its trusted session state.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_routing: BTreeMap<String, SwarmRoutingStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swarm_id: Option<String>,
     pub version: u64,
@@ -376,6 +408,7 @@ fn default_plan_mode() -> String {
 impl PlanGraphStatus {
     pub fn empty_for_swarm(swarm_id: impl Into<String>) -> Self {
         Self {
+            node_routing: BTreeMap::new(),
             swarm_id: Some(swarm_id.into()),
             version: 0,
             item_count: 0,
@@ -415,6 +448,27 @@ impl PlanGraphStatus {
             })
             .collect();
         Self {
+            node_routing: plan
+                .node_meta
+                .iter()
+                .filter(|(_, meta)| {
+                    meta.model.is_some()
+                        || meta.effort.is_some()
+                        || meta.resolved_execution.is_some()
+                })
+                .map(|(id, meta)| {
+                    (
+                        id.clone(),
+                        SwarmRoutingStatus {
+                            requested_model: meta.model.clone(),
+                            requested_effort: meta.effort.clone(),
+                            resolved_execution: meta.resolved_execution.clone(),
+                            // Operator/ancestry policy is server-owned, not plan metadata.
+                            ..SwarmRoutingStatus::default()
+                        },
+                    )
+                })
+                .collect(),
             swarm_id: Some(swarm_id.into()),
             version: plan.version,
             item_count: plan.items.len(),
@@ -490,6 +544,8 @@ pub struct SwarmMemberStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwarmMemberRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<SwarmRoutingStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -504,7 +560,8 @@ pub struct SwarmMemberRuntime {
 
 impl SwarmMemberRuntime {
     fn is_empty(&self) -> bool {
-        self.model.is_none()
+        self.routing.is_none()
+            && self.model.is_none()
             && self.provider.is_none()
             && self.auth_method.is_none()
             && self.effort.is_none()

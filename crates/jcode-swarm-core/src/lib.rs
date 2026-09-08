@@ -213,6 +213,12 @@ impl<'de> Deserialize<'de> for SwarmLifecycleStatus {
 /// Durable, persistable portion of a swarm member.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwarmMemberRecord {
+    /// Persisted effective subtree restriction at admission. None adds no local
+    /// restriction, Some([]) permits no new execution. The server must still
+    /// intersect current operator policy and trusted ancestors on every retry or
+    /// resume. Missing ancestry is not permission to become unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
     pub session_id: String,
     pub working_dir: Option<PathBuf>,
     pub swarm_id: Option<String>,

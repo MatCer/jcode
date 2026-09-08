@@ -80,6 +80,8 @@ fn seed_specs_equivalent(left: &NodeSpec, right: &NodeSpec) -> bool {
         && left.content == right.content
         && left.kind == right.kind
         && left.priority == right.priority
+        && left.model == right.model
+        && left.effort == right.effort
         && dependency_sets_equal(&left.depends_on, &right.depends_on)
 }
 
@@ -93,6 +95,8 @@ fn seed_spec_matches_existing(graph: &TaskGraph, node: &TaskNode, spec: &NodeSpe
         || node.content != spec.content
         || node.kind != spec.kind
         || node.priority != spec.priority
+        || node.model != spec.model
+        || node.effort != spec.effort
     {
         return false;
     }
@@ -202,6 +206,12 @@ fn ensure_root_gate(graph: &mut TaskGraph) {
                 planner: None,
                 priority: 0,
                 output: None,
+                // Generated gates have independent selection: no copied worker
+                // request/identity. Server admission applies trusted ancestry
+                // restrictions and coordinator/config defaults, including [] denial.
+                model: None,
+                effort: None,
+                resolved_execution: None,
                 origin: Some(NodeOrigin::Gate),
             });
         }
@@ -325,6 +335,11 @@ pub fn expand_node(
             planner: None,
             priority: 0,
             output: None,
+            // Apply server ancestry/defaults, not the parent's explicit choice.
+            // Parent execution remains unchanged for its synthesis re-wake.
+            model: None,
+            effort: None,
+            resolved_execution: None,
             origin: Some(NodeOrigin::Gate),
         };
         staged.push(gate);
@@ -640,6 +655,17 @@ fn validated_spec_id(spec: &NodeSpec, op: &str) -> Result<String, DagError> {
             "{op} specs must carry non-empty ids"
         )));
     }
+    for (field, value) in [("model", &spec.model), ("effort", &spec.effort)] {
+        if value
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(DagError::InvalidSelector {
+                node: id,
+                field: field.into(),
+            });
+        }
+    }
     Ok(id)
 }
 
@@ -665,6 +691,9 @@ fn spec_to_node(spec: NodeSpec, parent: Option<String>, origin: NodeOrigin) -> T
         is_gate: false,
         planner: None,
         priority: spec.priority,
+        model: spec.model,
+        effort: spec.effort,
+        resolved_execution: None,
         output: None,
         origin: Some(origin),
     }

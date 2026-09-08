@@ -1463,3 +1463,16 @@ fn config_reload_generation_increments_on_cache_invalidation() {
         "invalidate_config_cache must bump the reload generation ({before} -> {after})"
     );
 }
+
+#[test]
+fn swarm_routing_config_toml_defaults_and_empty_policy() {
+    let old: Config = toml::from_str("[agents]\nswarm_model = \"inherit\"\n").unwrap();
+    let value = serde_json::to_value(&old.agents).unwrap();
+    assert_eq!(value["swarm_model_selection"], false);
+    let empty: Config =
+        toml::from_str("[agents]\nswarm_model_selection = true\nswarm_allowed_models = []\n")
+            .unwrap();
+    let value = serde_json::to_value(&empty.agents).unwrap();
+    assert_eq!(value["swarm_model_selection"], true);
+    assert_eq!(value["swarm_allowed_models"], serde_json::json!([]));
+}

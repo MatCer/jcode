@@ -319,6 +319,8 @@ fn test_comm_task_control_roundtrip() -> Result<()> {
 #[test]
 fn test_comm_assign_task_roundtrip_without_explicit_task_id() -> Result<()> {
     let req = Request::CommAssignTask {
+        model: None,
+        effort: None,
         id: 57,
         session_id: "sess_coord".to_string(),
         target_session: None,
@@ -353,6 +355,7 @@ fn test_comm_assign_task_roundtrip_without_explicit_task_id() -> Result<()> {
 #[test]
 fn test_comm_assign_task_response_roundtrip() -> Result<()> {
     let event = ServerEvent::CommAssignTaskResponse {
+        routing: None,
         id: 60,
         task_id: "task-7".to_string(),
         target_session: "sess_worker".to_string(),
@@ -364,6 +367,7 @@ fn test_comm_assign_task_response_roundtrip() -> Result<()> {
         id,
         task_id,
         target_session,
+        ..
     } = decoded
     else {
         return Err(anyhow!("expected CommAssignTaskResponse"));
@@ -377,6 +381,7 @@ fn test_comm_assign_task_response_roundtrip() -> Result<()> {
 #[test]
 fn test_comm_assign_next_roundtrip() -> Result<()> {
     let req = Request::CommAssignNext {
+        allowed_models: None,
         id: 60,
         session_id: "sess_coord".to_string(),
         target_session: Some("sess_worker".to_string()),
@@ -448,6 +453,7 @@ fn test_comm_stop_roundtrip_with_force() -> Result<()> {
 #[test]
 fn test_comm_spawn_roundtrip_with_optional_nonce() -> Result<()> {
     let req = Request::CommSpawn {
+        allowed_models: None,
         id: 59,
         session_id: "sess_coord".to_string(),
         working_dir: Some("/tmp/project".to_string()),
@@ -614,5 +620,134 @@ fn test_reload_force_roundtrip() -> Result<()> {
         assert_eq!(id, 9);
         assert_eq!(decoded_force, force);
     }
+    Ok(())
+}
+
+#[test]
+fn test_comm_routing_wire_requests_preserve_optional_constraints() -> Result<()> {
+    for kind in ["comm_spawn", "comm_assign_next"] {
+        for allowed in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(["openai-oauth:gpt-6-astra"])),
+        ] {
+            let mut input = serde_json::json!({"type":kind, "id":1, "session_id":"root", "model":"openai-oauth:gpt-6-astra", "effort":"high"});
+            if let Some(value) = &allowed {
+                input["allowed_models"] = value.clone();
+            }
+            let request: Request = serde_json::from_value(input)?;
+            let output = serde_json::to_value(request)?;
+            assert_eq!(output["model"], "openai-oauth:gpt-6-astra");
+            assert_eq!(output["effort"], "high");
+            assert_eq!(output.get("allowed_models").cloned(), allowed);
+        }
+        let old: Request =
+            serde_json::from_value(serde_json::json!({"type":kind,"id":1,"session_id":"root"}))?;
+        let output = serde_json::to_value(old)?;
+        for field in ["model", "effort", "allowed_models"] {
+            assert!(output.get(field).is_none());
+        }
+    }
+    let node: TaskGraphNodeSpec = serde_json::from_value(
+        serde_json::json!({"id":"r","content":"work","model":"claude-oauth:claude-opus-5","effort":"medium"}),
+    )?;
+    let output = serde_json::to_value(node)?;
+    assert_eq!(output["model"], "claude-oauth:claude-opus-5");
+    assert_eq!(output["effort"], "medium");
+    let old: TaskGraphNodeSpec =
+        serde_json::from_value(serde_json::json!({"id":"old","content":"work"}))?;
+    assert!(serde_json::to_value(old)?.get("model").is_none());
+    Ok(())
+}
+
+#[test]
+fn test_comm_routing_status_roundtrips_actual_identity_and_policy() -> Result<()> {
+    let routing = serde_json::json!({
+        "requested_model":"openai-oauth:gpt-6-astra", "requested_effort":"high",
+        "resolved_execution":{"model":"gpt-6-astra","provider_key":"openai-oauth","api_method":"OpenAI OAuth","provider_label":"OpenAI","effort":"high"},
+        "actual_execution":{"model":"gpt-6-astra","provider_key":"openai-oauth","api_method":"OpenAI OAuth","provider_label":"OpenAI","effort":"high"},
+        "selection_enabled":true,"allowed_models":[]
+    });
+    for input in [
+        serde_json::json!({"type":"comm_spawn_response","id":1,"session_id":"root","new_session_id":"child","routing":routing}),
+        serde_json::json!({"type":"comm_assign_task_response","id":1,"task_id":"r","target_session":"child","routing":routing}),
+        serde_json::json!({"type":"comm_list_models_response","id":1,"routing":routing}),
+    ] {
+        let event: ServerEvent = serde_json::from_value(input.clone())?;
+        assert_eq!(serde_json::to_value(event)?["routing"], routing);
+        let mut old = input;
+        old.as_object_mut().unwrap().remove("routing");
+        let event: ServerEvent = serde_json::from_value(old)?;
+        assert!(serde_json::to_value(event)?.get("routing").is_none());
+    }
+    let runtime: SwarmMemberRuntime =
+        serde_json::from_value(serde_json::json!({"routing":routing}))?;
+    assert_eq!(serde_json::to_value(&runtime)?["routing"], routing);
+    assert!(!runtime.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_comm_routing_plan_status_reports_durable_requests_and_execution() -> Result<()> {
+    let mut plan = VersionedPlan::default();
+    let metadata: jcode_plan::NodeMeta = serde_json::from_value(serde_json::json!({
+        "model":"claude-oauth:claude-opus-5", "effort":"medium",
+        "resolved_execution":{"model":"claude-opus-5","provider_key":"claude-oauth","api_method":"Claude OAuth","provider_label":"Anthropic","effort":"medium"}
+    }))?;
+    plan.node_meta.insert("r".into(), metadata.clone());
+    let status = PlanGraphStatus::from_versioned_plan("swarm", &plan, None, vec![]);
+    let output = serde_json::to_value(status)?;
+    assert!(
+        output["node_routing"]["r"]
+            .get("actual_execution")
+            .is_none(),
+        "persisted selection alone is not proof of initialized identity"
+    );
+    assert_eq!(
+        output["node_routing"]["r"]["requested_model"],
+        "claude-oauth:claude-opus-5"
+    );
+    assert_eq!(output["node_routing"]["r"]["requested_effort"], "medium");
+    assert_eq!(
+        output["node_routing"]["r"]["resolved_execution"],
+        serde_json::to_value(metadata)?["resolved_execution"]
+    );
+    Ok(())
+}
+
+#[test]
+fn test_comm_routing_wire_to_plan_bridge_keeps_requested_constraints() -> Result<()> {
+    let wire: TaskGraphNodeSpec = serde_json::from_value(serde_json::json!({
+        "id":"r", "content":"work", "model":"openai-oauth:gpt-6-astra", "effort":"high",
+        "resolved_execution":{"model":"untrusted"}
+    }))?;
+    // Resolved identity is output-only, never admitted from untrusted node specs.
+    assert!(
+        serde_json::to_value(&wire)?
+            .get("resolved_execution")
+            .is_none()
+    );
+    let spec = jcode_plan::dag::NodeSpec {
+        id: Some(wire.id),
+        content: wire.content,
+        kind: jcode_plan::dag::NodeKind::Explore,
+        depends_on: wire.depends_on,
+        priority: wire.priority,
+        model: wire.model,
+        effort: wire.effort,
+    };
+    let mut graph = jcode_plan::dag::TaskGraph::new(jcode_plan::dag::Mode::Light);
+    jcode_plan::dag::seed(&mut graph, vec![spec])?;
+    let mut plan = VersionedPlan::default();
+    jcode_plan::bridge::apply_task_graph(&mut plan, &graph);
+    plan.node_meta = serde_json::from_slice(&serde_json::to_vec(&plan.node_meta)?)?;
+    let lifted = jcode_plan::bridge::to_task_graph(&plan);
+    assert_eq!(lifted.get("r"), graph.get("r"));
+    assert_eq!(
+        plan.node_meta["r"].model.as_deref(),
+        Some("openai-oauth:gpt-6-astra")
+    );
+    assert_eq!(plan.node_meta["r"].effort.as_deref(), Some("high"));
+    assert!(plan.node_meta["r"].resolved_execution.is_none());
     Ok(())
 }

@@ -542,12 +542,19 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
+    /// Opt in to explicit per-worker/per-node model selection. Default false.
+    /// This does not change the configured pin or inheritance when no model is requested.
+    pub swarm_model_selection: bool,
+    /// Optional allowed selectors when selection is enabled. None adds no restriction;
+    /// Some([]) denies new execution, including default/inherited routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_allowed_models: Option<Vec<String>>,
     /// Optional default model override for spawned swarm/subagent sessions.
     ///
     /// Leave unset (or use `"inherit"` / `"coordinator"`) to have spawned swarm
     /// agents inherit the spawning coordinator's model. Set to a concrete model
     /// string to change the worker default. An explicit `model` in the swarm
-    /// tool overrides this default for newly spawned workers.
+    /// tool overrides this default only when `swarm_model_selection` is enabled.
     pub swarm_model: Option<String>,
     /// Optional default reasoning effort for spawned swarm/subagent sessions
     /// (`"low"`, `"medium"`, `"high"`, ...). Applied when a `swarm spawn`
@@ -654,6 +661,8 @@ fn default_memory_rerank_min_agree() -> usize {
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
+            swarm_model_selection: false,
+            swarm_allowed_models: None,
             swarm_model: None,
             swarm_effort: None,
             swarm_spawn_mode: SwarmSpawnMode::default(),
@@ -1593,5 +1602,36 @@ mod reasoning_display_defaults_tests {
         display.set_reasoning_display(ReasoningDisplayMode::Off);
         assert!(display.has_explicit_reasoning_display());
         assert!(!display.show_thinking);
+    }
+}
+
+#[cfg(test)]
+mod swarm_routing_tests {
+    use super::*;
+
+    #[test]
+    fn routing_config_defaults_off_and_preserves_allowlist_presence() {
+        let defaults = serde_json::to_value(AgentsConfig::default()).unwrap();
+        assert_eq!(defaults["swarm_model_selection"], false);
+        for allowlist in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(["openai-oauth:gpt-6-astra"])),
+        ] {
+            let mut input = serde_json::json!({});
+            if let Some(value) = &allowlist {
+                input["swarm_allowed_models"] = value.clone();
+            }
+            let config: AgentsConfig = serde_json::from_value(input).unwrap();
+            let output = serde_json::to_value(config).unwrap();
+            assert_eq!(output["swarm_model_selection"], false);
+            assert_eq!(
+                output
+                    .get("swarm_allowed_models")
+                    .filter(|v| !v.is_null())
+                    .cloned(),
+                allowlist
+            );
+        }
     }
 }

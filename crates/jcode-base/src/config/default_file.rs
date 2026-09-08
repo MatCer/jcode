@@ -420,7 +420,15 @@ wake_mode = "internal"
 # Default model for spawned swarm/subagent sessions.
 # Leave unset (or "inherit"/"coordinator") so workers inherit the model of the
 # session that spawned them. Set a concrete model to change the worker default.
-# An explicit `model` in the swarm tool overrides this default for new workers.
+# Explicit worker/node `model` requires opt-in (including inherit/coordinator).
+# Existing override users must enable this. No-override pin/inheritance is unchanged.
+# Blank explicit model/effort is rejected: omit the field to use defaults.
+# swarm_model_selection = false
+# Optional exact selectors or existing route-qualified selectors. Missing = no
+# added model restriction. An explicit [] denies new execution, including defaults.
+# Bare models allow available providers; qualify selectors to restrict auth routes.
+# swarm_allowed_models = ["openai-oauth:gpt-6-astra", "claude-oauth:claude-opus-5"]
+# When enabled, explicit model overrides the configured default for new workers.
 # Env override: JCODE_SWARM_MODEL
 # swarm_model = "inherit"
 #

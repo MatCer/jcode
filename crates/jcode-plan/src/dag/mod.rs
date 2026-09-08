@@ -347,6 +347,15 @@ impl HandoffArtifact {
 /// A single task node in the DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskNode {
+    /// Explicit requested selector. Blank is invalid: omit the field for defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Explicit requested effort, independent of model selection. Blank is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Server-selected durable identity. Never copied to newly generated work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_execution: Option<crate::ResolvedExecution>,
     pub id: NodeId,
     /// The task prompt/instructions for the worker.
     pub content: String,
@@ -405,6 +414,13 @@ impl TaskNode {
 /// auto-assigned by the engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSpec {
+    /// Explicit requested selector. Blank is invalid: omit the field for defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Explicit requested effort, independent of model selection. Blank is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<NodeId>,
     pub content: String,
@@ -418,6 +434,8 @@ pub struct NodeSpec {
 impl NodeSpec {
     pub fn new(id: impl Into<String>, content: impl Into<String>, kind: NodeKind) -> Self {
         Self {
+            model: None,
+            effort: None,
             id: Some(id.into()),
             content: content.into(),
             kind,
@@ -466,6 +484,8 @@ pub enum DagError {
     /// (new work arrived after the gate was dispatched, e.g. a re-seed widened
     /// the root set). The gate's view is stale; it must re-run after they drain.
     StaleGateScope { gate: NodeId, pending: Vec<NodeId> },
+    /// An explicit selector was blank. Defaults require omitting the field.
+    InvalidSelector { node: NodeId, field: String },
     /// A gate kind was supplied as user work, or vice versa.
     GateMisuse(String),
 }
@@ -473,6 +493,10 @@ pub enum DagError {
 impl std::fmt::Display for DagError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DagError::InvalidSelector { node, field } => write!(
+                f,
+                "node '{node}' has a blank explicit {field}; omit '{field}' to use defaults or provide a non-blank value"
+            ),
             DagError::UnknownNode(id) => write!(f, "unknown node '{id}'"),
             DagError::DuplicateNode(id) => write!(f, "duplicate node id '{id}'"),
             DagError::UnknownDependency { node, dependency } => {
