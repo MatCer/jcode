@@ -611,6 +611,7 @@ pub(super) async fn handle_lightweight_control_request(
                 req_session_id,
                 swarm_members,
                 swarm_plans,
+                sessions,
                 &client_event_tx,
             )
             .await;
@@ -687,6 +688,7 @@ pub(super) async fn handle_lightweight_control_request(
             id,
             session_id: req_session_id,
             target_session,
+            task_id,
             working_dir,
             prefer_spawn,
             spawn_if_needed,
@@ -699,6 +701,7 @@ pub(super) async fn handle_lightweight_control_request(
                 id,
                 req_session_id,
                 target_session,
+                task_id,
                 working_dir,
                 prefer_spawn,
                 spawn_if_needed,

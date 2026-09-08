@@ -385,6 +385,7 @@ fn test_comm_assign_next_roundtrip() -> Result<()> {
         id: 60,
         session_id: "sess_coord".to_string(),
         target_session: Some("sess_worker".to_string()),
+        task_id: None,
         working_dir: Some("/tmp/project".to_string()),
         prefer_spawn: Some(true),
         spawn_if_needed: Some(true),
@@ -750,4 +751,20 @@ fn test_comm_routing_wire_to_plan_bridge_keeps_requested_constraints() -> Result
     assert_eq!(plan.node_meta["r"].effort.as_deref(), Some("high"));
     assert!(plan.node_meta["r"].resolved_execution.is_none());
     Ok(())
+}
+
+#[test]
+fn routing_assign_next_preserves_optional_exact_task_without_changing_legacy_wire() {
+    for task in [None, Some("exact-task"), Some("  ")] {
+        let mut input = serde_json::json!({"type":"comm_assign_next","id":91,"session_id":"coord"});
+        if let Some(task) = task {
+            input["task_id"] = serde_json::json!(task);
+        }
+        let request: Request = serde_json::from_value(input).unwrap();
+        let output = serde_json::to_value(request).unwrap();
+        assert_eq!(output.get("task_id").and_then(|id| id.as_str()), task);
+        if task.is_none() {
+            assert!(output.get("task_id").is_none());
+        }
+    }
 }

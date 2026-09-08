@@ -20,6 +20,24 @@ use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
+// Callers hold the shared process-environment lock. Restore even after panic.
+struct TestHome(Option<std::ffi::OsString>);
+impl TestHome {
+    fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", path);
+        Self(previous)
+    }
+}
+impl Drop for TestHome {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => crate::env::set_var("JCODE_HOME", previous),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+    }
+}
+
 struct MockProvider;
 
 #[async_trait]
@@ -244,7 +262,7 @@ async fn register_visible_spawned_member_marks_startup_as_running() {
 fn prepare_visible_spawn_session_persists_startup_before_launch() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = TestHome::set(temp_home.path());
 
     let worktree = tempfile::TempDir::new().expect("temp worktree");
     let startup = "Please start by auditing prompt delivery.";
@@ -284,15 +302,13 @@ fn prepare_visible_spawn_session_persists_startup_before_launch() {
         path.exists(),
         "startup file should remain for launched visible session"
     );
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 #[test]
 fn prepare_visible_spawn_session_cleans_startup_when_launch_not_started() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = TestHome::set(temp_home.path());
 
     let worktree = tempfile::TempDir::new().expect("temp worktree");
 
@@ -320,15 +336,13 @@ fn prepare_visible_spawn_session_cleans_startup_when_launch_not_started() {
         !crate::session::session_exists(&session_id),
         "prepared session should be cleaned up when visible launch does not start"
     );
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 #[test]
 fn prepare_visible_spawn_session_cleans_session_when_launch_errors() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = TestHome::set(temp_home.path());
 
     let worktree = tempfile::TempDir::new().expect("temp worktree");
 
@@ -357,15 +371,13 @@ fn prepare_visible_spawn_session_cleans_session_when_launch_errors() {
         remaining_sessions, 0,
         "failed visible launch should not leave orphan prepared sessions"
     );
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 #[test]
 fn prepare_visible_spawn_session_persists_and_launches_provider_key_for_openrouter_model() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = TestHome::set(temp_home.path());
 
     let worktree = tempfile::TempDir::new().expect("temp worktree");
     let (session_id, launched) = prepare_visible_spawn_session(
@@ -387,15 +399,13 @@ fn prepare_visible_spawn_session_persists_and_launches_provider_key_for_openrout
     let session = crate::session::Session::load(&session_id).expect("prepared session should save");
     assert_eq!(session.model.as_deref(), Some("openai/gpt-5.4@OpenAI"));
     assert_eq!(session.provider_key.as_deref(), Some("openrouter"));
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 #[test]
 fn prepare_visible_spawn_session_persists_requested_effort() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = TestHome::set(temp_home.path());
 
     let worktree = tempfile::TempDir::new().expect("temp worktree");
     let (session_id, launched) = prepare_visible_spawn_session(
@@ -418,15 +428,13 @@ fn prepare_visible_spawn_session_persists_requested_effort() {
         Some("low"),
         "requested effort should persist so the headed client restores it"
     );
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 #[test]
 fn prepare_visible_spawn_session_prefers_parent_provider_key_over_model_guess() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = TestHome::set(temp_home.path());
 
     let worktree = tempfile::TempDir::new().expect("temp worktree");
     let (session_id, launched) = prepare_visible_spawn_session(
@@ -448,8 +456,6 @@ fn prepare_visible_spawn_session_prefers_parent_provider_key_over_model_guess() 
     let session = crate::session::Session::load(&session_id).expect("prepared session should save");
     assert_eq!(session.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(session.provider_key.as_deref(), Some("ollama"));
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 fn coordinator_identity(
@@ -779,7 +785,7 @@ async fn coordinator_identity_uses_live_agent_when_lock_is_available() {
 async fn coordinator_identity_falls_back_to_persisted_session_when_agent_busy() {
     let _guard = crate::storage::lock_test_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
-    crate::env::set_var("JCODE_HOME", temp_home.path());
+    let _home = TestHome::set(temp_home.path());
 
     let agent = test_agent_with_working_dir("coord_busy", "/tmp/coord").await;
 
@@ -787,10 +793,12 @@ async fn coordinator_identity_falls_back_to_persisted_session_when_agent_busy() 
     // Persist after the agent is built so it reflects the authoritative on-disk
     // snapshot the spawn path will read when the agent lock is unavailable.
     let mut session = crate::session::Session::create_with_id("coord_busy".to_string(), None, None);
+    session.title = Some("Active coordinator turn".to_string());
     session.model = Some("claude-opus-4-6".to_string());
     session.provider_key = Some("claude-api".to_string());
     session.route_api_method = Some("claude-api".to_string());
     session.save().expect("persist coordinator session");
+    assert!(crate::session::Session::load_startup_stub("coord_busy").is_ok());
 
     // Hold the agent lock to simulate a coordinator mid-turn: the spawn path
     // must not block and must read the persisted identity instead of defaults.
@@ -805,8 +813,6 @@ async fn coordinator_identity_falls_back_to_persisted_session_when_agent_busy() 
     assert_eq!(identity.model.as_deref(), Some("claude-opus-4-6"));
     assert_eq!(identity.provider_key.as_deref(), Some("claude-api"));
     assert_eq!(identity.route_api_method.as_deref(), Some("claude-api"));
-
-    crate::env::remove_var("JCODE_HOME");
 }
 
 #[tokio::test]

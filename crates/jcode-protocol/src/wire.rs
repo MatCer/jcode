@@ -684,6 +684,10 @@ pub enum Request {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_session: Option<String>,
+        /// Optional exact runnable, unassigned node. Omission selects the next
+        /// runnable node. Invalid/blocked ids fail before claims or spawning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_dir: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

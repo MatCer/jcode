@@ -32,14 +32,6 @@ const LIGHT_MODE_DEFAULT_CONCURRENCY: usize = 4;
 mod transport;
 use transport::{send_request, send_request_with_timeout};
 
-fn fresh_spawn_request_nonce(ctx: &ToolContext) -> String {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("{}-{}-{}", ctx.session_id, ctx.message_id, now_ms)
-}
-
 fn check_error(response: &ServerEvent) -> Option<&str> {
     if let ServerEvent::Error { message, .. } = response {
         Some(message)
@@ -186,14 +178,6 @@ fn cleanup_candidate_session_ids(
         requested_session_ids,
         force,
     )
-}
-
-fn auto_assignment_needs_spawn(response: &ServerEvent) -> bool {
-    check_error(response).is_some_and(|message| {
-        message.contains(
-            "No ready or completed swarm agents are available for automatic task assignment",
-        )
-    })
 }
 
 async fn fetch_swarm_members(session_id: &str) -> Result<Vec<AgentInfo>> {
@@ -959,7 +943,9 @@ enum AssignErrorAction {
 }
 
 fn classify_assign_error(message: &str) -> AssignErrorAction {
-    if message.contains("No runnable unassigned tasks")
+    if message.contains("routing blocked:") {
+        AssignErrorAction::Fail
+    } else if message.contains("No runnable unassigned tasks")
         || message.contains("No ready or completed swarm agents")
     {
         AssignErrorAction::BreakGracefully
@@ -1371,6 +1357,7 @@ async fn run_swarm_plan_loop(
                 id: REQUEST_ID,
                 session_id: ctx.session_id.clone(),
                 target_session: params.target_session.clone(),
+                task_id: None,
                 working_dir: params.working_dir.clone(),
                 prefer_spawn: if reuse_only {
                     Some(false)
@@ -1385,17 +1372,22 @@ async fn run_swarm_plan_loop(
                 message: params.message.clone(),
                 model: params.model.clone(),
                 effort: params.effort.clone(),
+                allowed_models: params.allowed_models.clone(),
             };
             match send_request(request).await {
                 Ok(ServerEvent::CommAssignTaskResponse {
                     task_id,
                     target_session,
+                    routing,
                     ..
                 }) => {
                     assignment_count += 1;
                     slots_remaining -= 1;
                     reporter
-                        .log(&format!("assigned {} -> {}", task_id, target_session))
+                        .log(&with_routing_details(
+                            format!("assigned {} -> {}", task_id, target_session),
+                            routing.as_ref(),
+                        ))
                         .await;
                     assigned_sessions.push(target_session);
                 }
@@ -1526,68 +1518,15 @@ async fn run_swarm_plan_loop(
     }
 }
 
-async fn spawn_assignment_session(ctx: &ToolContext, params: &CommunicateInput) -> Result<String> {
-    let spawn_request = Request::CommSpawn {
-        id: REQUEST_ID,
-        session_id: ctx.session_id.clone(),
-        working_dir: params.working_dir.clone(),
-        initial_message: None,
-        request_nonce: Some(fresh_spawn_request_nonce(ctx)),
-        spawn_mode: params.spawn_mode.clone(),
-        model: params.model.clone(),
-        effort: params.effort.clone(),
-        label: None,
-    };
-
-    match send_request(spawn_request).await {
-        Ok(ServerEvent::CommSpawnResponse { new_session_id, .. }) if !new_session_id.is_empty() => {
-            Ok(new_session_id)
-        }
-        Ok(spawn_response) => {
-            ensure_success(&spawn_response)?;
-            Err(anyhow::anyhow!(
-                "Spawn succeeded but new session ID was not returned."
-            ))
-        }
-        Err(e) => Err(anyhow::anyhow!(
-            "Failed to spawn agent for task assignment: {}",
-            e
-        )),
+fn with_routing_details(
+    mut output: String,
+    routing: Option<&crate::protocol::SwarmRoutingStatus>,
+) -> String {
+    if let Some(routing) = routing {
+        output.push('\n');
+        output.push_str(&crate::protocol::format_comm_routing_status(routing));
     }
-}
-
-async fn assign_task_to_session(
-    ctx: &ToolContext,
-    params: &CommunicateInput,
-    target_session: String,
-    spawned_suffix: &str,
-) -> Result<ToolOutput> {
-    let retry_request = Request::CommAssignTask {
-        id: REQUEST_ID,
-        session_id: ctx.session_id.clone(),
-        target_session: Some(target_session.clone()),
-        task_id: params.task_id.clone(),
-        message: params.message.clone(),
-    };
-
-    match send_request(retry_request).await {
-        Ok(ServerEvent::CommAssignTaskResponse { task_id, .. }) => Ok(ToolOutput::new(format!(
-            "Task '{}' assigned to {}{}",
-            task_id, target_session, spawned_suffix
-        ))),
-        Ok(retry_response) => {
-            ensure_success(&retry_response)?;
-            Ok(ToolOutput::new(format!(
-                "Assigned next runnable task to {}{}",
-                target_session, spawned_suffix
-            )))
-        }
-        Err(e) => Err(anyhow::anyhow!(
-            "Failed to assign task after selecting {}: {}",
-            target_session,
-            e
-        )),
-    }
+    output
 }
 
 fn format_context_entries(entries: &[ContextEntry]) -> ToolOutput {
@@ -1735,6 +1674,7 @@ fn format_swarm_model_list(
     current_model: Option<&str>,
     configured_swarm_model: Option<&str>,
     model_routes: &[jcode_provider_core::ModelRoute],
+    routing: Option<&crate::protocol::SwarmRoutingStatus>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1749,11 +1689,26 @@ fn format_swarm_model_list(
             "No agents.swarm_model default configured (workers inherit the coordinator's model unless model is passed).\n",
         ),
     }
+    match routing.and_then(|routing| routing.selection_enabled) {
+        Some(true) => out.push_str("Explicit model selection: enabled\n"),
+        Some(false) => out.push_str("Explicit model selection: disabled. Omit model or ask the operator to enable agents.swarm_model_selection.\n"),
+        None => out.push_str("Explicit model selection: unknown (server did not report policy).\n"),
+    }
+    if let Some(routing) = routing {
+        match routing.allowed_models.as_ref() {
+            None => out.push_str("Effective allowed models: unrestricted by allowlist (availability still required)\n"),
+            Some(allowed) if allowed.is_empty() => out.push_str("Effective allowed models: [] (new execution denied)\n"),
+            Some(allowed) => out.push_str(&format!("Effective allowed models: {}\n", allowed.join(", "))),
+        }
+        out.push_str(&crate::protocol::format_comm_routing_status(routing));
+    } else {
+        out.push_str("Effective allowed models: unknown\n");
+    }
     if model_routes.is_empty() {
-        out.push_str("\nNo model routes reported. Omit model to use the configured default, or pass inherit to use the coordinator.");
+        out.push_str("\nNo model routes reported. Omit model to use the configured default. Explicit inherit requires selection to be enabled.");
         return out;
     }
-    out.push_str("\nAvailable model routes (pass model with a bare model or route-pinned value to override the configured default):\n");
+    out.push_str("\nAvailable model routes (catalog availability is not policy permission; explicit selection requires opt-in):\n");
     for route in model_routes {
         let availability = if route.available {
             ""
@@ -1770,8 +1725,14 @@ fn format_swarm_model_list(
             format!(" ({})", route.detail)
         };
         out.push_str(&format!(
-            "- {} via {} [{}]{}{}{}\n",
-            route.model, route.provider, route.api_method, availability, cost, detail
+            "- {} via {} [{}]{}{}{} selector={}\n",
+            route.model,
+            route.provider,
+            route.api_method,
+            availability,
+            cost,
+            detail,
+            jcode_provider_core::RouteSelection::from_model_route(route).routed_model_spec()
         ));
     }
     out.push_str("\nAlso pass effort (none|minimal|low|medium|high|xhigh|max) to set the spawned agent's reasoning effort.");
@@ -1894,6 +1855,9 @@ struct CommunicateInput {
     /// Takes precedence over agents.swarm_model; see list_models for routes.
     #[serde(default)]
     model: Option<String>,
+    /// Optional narrower subtree policy. Empty denies new execution.
+    #[serde(default)]
+    allowed_models: Option<Vec<String>>,
     /// Short human-readable label for a spawned agent shown in swarm UI.
     /// Required and nonblank for the explicit `spawn` action.
     #[serde(default)]
@@ -2043,15 +2007,15 @@ impl Tool for CommunicateTool {
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Optional plan task ID. When omitted the coordinator picks or resumes the relevant task."
+                    "description": "Optional plan task ID. assign_task/assign_next can select an exact node; automatic spawning requires it to be runnable and unassigned. Omit for the next runnable task."
                 },
                 "spawn_if_needed": {
                     "type": "boolean",
-                    "description": "For assign_task: spawn a fresh agent when no reusable one is available."
+                    "description": "For assign_task/assign_next/fill_slots/run_plan: spawn a compatible agent when no reusable one is available."
                 },
                 "prefer_spawn": {
                     "type": "boolean",
-                    "description": "For assign_task: prefer spawning fresh over reusing an idle worker."
+                    "description": "For assignment: prefer spawning a compatible fresh worker over reusing an idle worker."
                 },
                 "spawn_mode": {
                     "type": "string",
@@ -2060,12 +2024,17 @@ impl Tool for CommunicateTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for newly spawned workers (spawn, assign_task, assign_next, fill_slots, run_plan), e.g. 'gpt-6-astra' or 'openai-api:gpt-5.6-luna'. Overrides agents.swarm_model. Omit to use that default or inherit the coordinator if unset. Use 'inherit' to force the coordinator's model and route. Does not change reused workers. See list_models."
+                    "description": "Model constraint for spawn/assignment (including reuse), requiring agents.swarm_model_selection=true (default off), e.g. 'gpt-6-astra' or 'openai-api:gpt-5.6-luna'. Overrides agents.swarm_model. Omit to use that default or inherit the coordinator if unset. Use 'inherit' to force the coordinator's model and route. Blank is an error. Node choices are authoritative; conflicting assignments fail. Reused workers must match. See list_models for effective policy."
+                },
+                "allowed_models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For spawn/assignment: narrower subtree model selectors. Omit to inherit, empty [] denies new execution. Cannot broaden trusted ancestry/operator restrictions."
                 },
                 "effort": {
                     "type": "string",
                     "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-                    "description": "Optional reasoning effort for spawned agents. Omit for the model default."
+                    "description": "Optional reasoning effort constraint for spawned/reused workers. Omit for existing defaults. Blank or unsupported explicit effort fails; node conflicts fail."
                 },
                 "session_ids": {
                     "type": "array",
@@ -2150,8 +2119,21 @@ impl Tool for CommunicateTool {
                 "nodes".to_string(),
                 json!({
                     "type": "array",
-                    "description": "Node specs for task_graph/expand_node/inject_gap. Each: {id, content, kind?, depends_on?, priority?}.",
-                    "items": { "type": "object", "additionalProperties": true }
+                    "description": "Node specs for task_graph/expand_node/inject_gap. Explicit model requires operator opt-in. Nodes inherit trusted subtree restrictions.",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "content"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "kind": {"type": "string"},
+                            "depends_on": {"type": "array", "items": {"type": "string"}},
+                            "priority": {"type": "integer"},
+                            "model": {"type": "string", "description": "Optional authoritative node model; requires agents.swarm_model_selection. Blank is an error. Use a route from list_models."},
+                            "effort": {"type": "string", "description": "Optional authoritative node effort. Blank/unsupported values fail; retry retains concrete execution."}
+                        },
+                        "additionalProperties": false
+                    }
                 }),
             );
             props.insert(
@@ -2220,6 +2202,17 @@ impl Tool for CommunicateTool {
         // Normalize common action synonyms that models invent (e.g. `inbox`, `send`,
         // `msg`) so a near-miss verb maps to the real action instead of erroring out.
         params.action = canonical_swarm_action(&params.action).to_string();
+        if (params.model.is_some() || params.effort.is_some() || params.allowed_models.is_some())
+            && !matches!(
+                params.action.as_str(),
+                "spawn" | "assign_task" | "assign_next" | "fill_slots" | "run_plan"
+            )
+        {
+            anyhow::bail!(
+                "Top-level routing fields are not supported for '{}'. Put model/effort in graph nodes; lifecycle operations retain pinned execution. Use a new node for changed constraints.",
+                params.action
+            );
+        }
 
         match params.action.as_str() {
             "share" | "share_append" => {
@@ -2741,18 +2734,19 @@ impl Tool for CommunicateTool {
                     spawn_mode: params.spawn_mode.clone(),
                     model: params.model.clone(),
                     effort: params.effort.clone(),
+                    allowed_models: params.allowed_models.clone(),
                     label: Some(label),
                 };
 
                 match send_request(request).await {
-                    Ok(ServerEvent::CommSpawnResponse { new_session_id, .. })
-                        if !new_session_id.is_empty() =>
-                    {
-                        Ok(ToolOutput::new(format!(
-                            "Spawned new agent: {}",
-                            new_session_id
-                        )))
-                    }
+                    Ok(ServerEvent::CommSpawnResponse {
+                        new_session_id,
+                        routing,
+                        ..
+                    }) if !new_session_id.is_empty() => Ok(ToolOutput::new(with_routing_details(
+                        format!("Spawned new agent: {}", new_session_id),
+                        routing.as_ref(),
+                    ))),
                     Ok(response) => {
                         ensure_success(&response)?;
                         Err(anyhow::anyhow!(
@@ -2773,11 +2767,13 @@ impl Tool for CommunicateTool {
                         current_model,
                         configured_swarm_model,
                         model_routes,
+                        routing,
                         ..
                     }) => Ok(ToolOutput::new(format_swarm_model_list(
                         current_model.as_deref(),
                         configured_swarm_model.as_deref(),
                         &model_routes,
+                        routing.as_ref(),
                     ))),
                     Ok(response) => {
                         ensure_success(&response)?;
@@ -2965,66 +2961,57 @@ impl Tool for CommunicateTool {
             }
 
             "assign_task" => {
-                let target = params
-                    .target_session
-                    .clone()
-                    .unwrap_or_else(|| "next available agent".to_string());
-                let spawn_if_needed = params.spawn_if_needed.unwrap_or(false);
-                let prefer_spawn = params.prefer_spawn.unwrap_or(false);
-
-                if prefer_spawn && params.target_session.is_none() {
-                    let spawned_session = spawn_assignment_session(&ctx, &params).await?;
-                    return assign_task_to_session(
-                        &ctx,
-                        &params,
-                        spawned_session,
-                        " (spawned by planner preference)",
-                    )
-                    .await;
-                }
-
-                let request = Request::CommAssignTask {
-                    id: REQUEST_ID,
-                    session_id: ctx.session_id.clone(),
-                    target_session: params.target_session.clone(),
-                    task_id: params.task_id.clone(),
-                    message: params.message.clone(),
+                // Exact-node automatic spawning must use server admission. Never
+                // spawn from caller defaults then discover a node conflict later.
+                let request = if params.prefer_spawn.unwrap_or(false)
+                    || params.spawn_if_needed.unwrap_or(false)
+                    || params.allowed_models.is_some()
+                {
+                    Request::CommAssignNext {
+                        id: REQUEST_ID,
+                        session_id: ctx.session_id.clone(),
+                        target_session: params.target_session.clone(),
+                        task_id: params.task_id.clone(),
+                        working_dir: params.working_dir.clone(),
+                        prefer_spawn: params.prefer_spawn,
+                        spawn_if_needed: params.spawn_if_needed,
+                        message: params.message.clone(),
+                        model: params.model.clone(),
+                        effort: params.effort.clone(),
+                        allowed_models: params.allowed_models.clone(),
+                    }
+                } else {
+                    Request::CommAssignTask {
+                        id: REQUEST_ID,
+                        session_id: ctx.session_id.clone(),
+                        target_session: params.target_session.clone(),
+                        task_id: params.task_id.clone(),
+                        message: params.message.clone(),
+                        model: params.model.clone(),
+                        effort: params.effort.clone(),
+                    }
                 };
-
                 match send_request(request).await {
                     Ok(ServerEvent::CommAssignTaskResponse {
                         task_id,
                         target_session,
+                        routing,
                         ..
                     }) => {
-                        let mut output =
-                            format!("Task '{}' assigned to {}", task_id, target_session);
+                        let mut output = with_routing_details(
+                            format!("Task '{}' assigned to {}", task_id, target_session),
+                            routing.as_ref(),
+                        );
                         if let Ok(summary) = fetch_plan_status(&ctx.session_id).await {
                             output.push_str(&format!("\n{}", format_plan_followup(&summary)));
                         }
                         Ok(ToolOutput::new(output))
                     }
-                    Ok(response)
-                        if spawn_if_needed
-                            && params.target_session.is_none()
-                            && auto_assignment_needs_spawn(&response) =>
-                    {
-                        let spawned_session = spawn_assignment_session(&ctx, &params).await?;
-                        assign_task_to_session(
-                            &ctx,
-                            &params,
-                            spawned_session,
-                            " (spawned automatically)",
-                        )
-                        .await
-                    }
                     Ok(response) => {
                         ensure_success(&response)?;
-                        let msg = params.task_id.as_deref().map_or_else(
-                            || format!("Assigned next runnable task to {}", target),
-                            |task_id| format!("Task '{}' assigned to {}", task_id, target),
-                        );
-                        Ok(ToolOutput::new(msg))
+                        Err(anyhow::anyhow!(
+                            "Assignment succeeded but no task/worker identity was returned."
+                        ))
                     }
                     Err(e) => Err(anyhow::anyhow!("Failed to assign task: {}", e)),
                 }
@@ -3040,22 +3027,25 @@ impl Tool for CommunicateTool {
                     id: REQUEST_ID,
                     session_id: ctx.session_id.clone(),
                     target_session: params.target_session.clone(),
+                    task_id: params.task_id.clone(),
                     working_dir: params.working_dir.clone(),
                     prefer_spawn: params.prefer_spawn,
                     spawn_if_needed: params.spawn_if_needed,
                     message: params.message.clone(),
                     model: params.model.clone(),
                     effort: params.effort.clone(),
+                    allowed_models: params.allowed_models.clone(),
                 };
 
                 match send_request(request).await {
                     Ok(ServerEvent::CommAssignTaskResponse {
                         task_id,
                         target_session,
+                        routing,
                         ..
-                    }) => Ok(ToolOutput::new(format!(
-                        "Task '{}' assigned to {}",
-                        task_id, target_session
+                    }) => Ok(ToolOutput::new(with_routing_details(
+                        format!("Task '{}' assigned to {}", task_id, target_session),
+                        routing.as_ref(),
                     ))),
                     Ok(response) => {
                         ensure_success(&response)?;
@@ -3092,23 +3082,28 @@ impl Tool for CommunicateTool {
                         id: REQUEST_ID,
                         session_id: ctx.session_id.clone(),
                         target_session: params.target_session.clone(),
+                        task_id: None,
                         working_dir: params.working_dir.clone(),
                         prefer_spawn: params.prefer_spawn,
                         spawn_if_needed: params.spawn_if_needed,
                         message: params.message.clone(),
                         model: params.model.clone(),
                         effort: params.effort.clone(),
+                        allowed_models: params.allowed_models.clone(),
                     };
 
                     match send_request(request).await {
                         Ok(ServerEvent::CommAssignTaskResponse {
                             task_id,
                             target_session,
+                            routing,
                             ..
                         }) => assignments.push(format!("{} -> {}", task_id, target_session)),
                         Ok(ServerEvent::Error { message, .. })
-                            if message.contains("No runnable unassigned tasks")
-                                || message.contains("No ready or completed swarm agents") =>
+                            if matches!(
+                                classify_assign_error(&message),
+                                AssignErrorAction::BreakGracefully
+                            ) =>
                         {
                             break;
                         }
@@ -3198,6 +3193,7 @@ impl Tool for CommunicateTool {
                         target_session,
                         status,
                         summary,
+                        routing,
                         ..
                     }) => {
                         let mut output = format!("Task '{}' {}", task_id, action);
@@ -3217,7 +3213,10 @@ impl Tool for CommunicateTool {
                                 summary.newly_ready_ids.join(", ")
                             ));
                         }
-                        Ok(ToolOutput::new(output))
+                        Ok(ToolOutput::new(with_routing_details(
+                            output,
+                            routing.as_ref(),
+                        )))
                     }
                     Ok(response) => {
                         ensure_success(&response)?;

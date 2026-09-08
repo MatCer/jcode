@@ -78,7 +78,10 @@ fn create_visible_spawn_session(
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    // This legacy test-only preparation helper represents an explicitly
+    // requested worker, not an untouched empty UI panel.
     let mut session = Session::create(None, None);
+    session.title = Some("Prepared swarm worker".into());
     session.working_dir = Some(cwd.display().to_string());
     if let Some(model) = model_override {
         session.model = Some(model.to_string());

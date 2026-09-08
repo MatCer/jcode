@@ -71,6 +71,9 @@ fn base_system_prompt_parts(
 /// (project). See [`load_swarm_prompt`].
 pub const DEFAULT_SWARM_PROMPT: &str = include_str!("prompt/swarm_prompt.md");
 
+/// Public runtime contract, not task-to-model selection policy.
+const SWARM_ROUTING_CONTRACT: &str = "Routing capability: explicit model selection requires operator agents.swarm_model_selection=true (default off). Check swarm list_models for effective policy and route availability. Omit model while disabled. Node choices are authoritative; conflicting, blank, forbidden or unavailable requests fail. Root and nested deep coordinators may only narrow allowed_models, never broaden trusted ancestry. Verify actual model/provider/API/effort, not only requested or pinned targets. If operator guidance contradicts the runtime capability, ask the operator to reconcile it after acceptance; do not change global config or prompt files.";
+
 /// Load the swarm prompt used to steer swarm model routing. Precedence:
 /// project `./.jcode/swarm-prompt.md`, then global `~/.jcode/swarm-prompt.md`,
 /// then the built-in [`DEFAULT_SWARM_PROMPT`].
@@ -82,15 +85,19 @@ pub fn load_swarm_prompt(working_dir: Option<&Path>) -> String {
             .ok()
             .map(|dir| dir.join("swarm-prompt.md")),
     ];
-    for path in candidates.into_iter().flatten() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-    DEFAULT_SWARM_PROMPT.trim().to_string()
+    let guidance = candidates
+        .into_iter()
+        .flatten()
+        .find_map(|path| {
+            std::fs::read_to_string(path).ok().and_then(|content| {
+                let trimmed = content.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+        })
+        .unwrap_or_else(|| DEFAULT_SWARM_PROMPT.trim().to_string());
+    // Every registry, including a nested coordinator's, composes the same public
+    // runtime contract with operator-authored guidance. No private role table.
+    format!("{SWARM_ROUTING_CONTRACT}\n\n{guidance}")
 }
 
 /// Reasoning-effort sentinel that means "use the strongest reasoning the model

@@ -150,6 +150,7 @@ async fn target_subscribe_busy_live_agent_uses_member_root_without_waiting() {
     let members = Arc::new(RwLock::new(HashMap::from([(
         id.into(),
         SwarmMember {
+            allowed_models: None,
             session_id: id.into(),
             event_tx,
             event_txs: HashMap::new(),

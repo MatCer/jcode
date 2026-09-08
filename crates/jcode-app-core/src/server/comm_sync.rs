@@ -294,20 +294,37 @@ pub(super) async fn handle_comm_status(
             live_activity_snapshot(&connections, &target_session, member.status == "running")
         };
 
-        let (provider_name, provider_model) = {
+        let (provider_name, provider_model, routing) = {
             let agent_sessions = sessions.read().await;
             if let Some(agent) = agent_sessions.get(&target_session) {
                 if let Ok(agent) = agent.try_lock() {
-                    (Some(agent.provider_name()), Some(agent.provider_model()))
+                    {
+                        let mut routing = member.runtime.routing.clone().unwrap_or_default();
+                        routing.actual_execution =
+                            super::comm_session::initialized_swarm_execution(
+                                agent.provider_fork().as_ref(),
+                            )
+                            .ok();
+                        (
+                            Some(agent.provider_name()),
+                            Some(agent.provider_model()),
+                            Some(routing),
+                        )
+                    }
                 } else {
-                    (None, None)
+                    (None, None, member.runtime.routing.clone())
                 }
             } else {
-                (None, None)
+                let mut routing = member.runtime.routing.clone();
+                if let Some(routing) = routing.as_mut() {
+                    routing.actual_execution = None;
+                }
+                (None, None, routing)
             }
         };
 
         AgentStatusSnapshot {
+            routing,
             session_id: member.session_id.clone(),
             friendly_name: member.friendly_name.clone(),
             swarm_id: member.swarm_id.clone(),
@@ -392,6 +409,7 @@ pub(super) async fn handle_comm_plan_status(
     req_session_id: String,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    sessions: &SessionAgents,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let swarm_id = {
@@ -410,16 +428,51 @@ pub(super) async fn handle_comm_plan_status(
         return;
     };
 
-    let summary = {
+    let (mut summary, assignments) = {
         let plans = swarm_plans.read().await;
         let plan = plans.get(&swarm_id);
         if let Some(plan) = plan {
-            PlanGraphStatus::from_versioned_plan(swarm_id.clone(), plan, Some(8), Vec::new())
+            (
+                PlanGraphStatus::from_versioned_plan(swarm_id.clone(), plan, Some(8), Vec::new()),
+                plan.items
+                    .iter()
+                    .filter_map(|item| {
+                        item.assigned_to
+                            .as_ref()
+                            .map(|session| (item.id.clone(), session.clone()))
+                    })
+                    .collect::<Vec<_>>(),
+            )
         } else {
-            PlanGraphStatus::empty_for_swarm(swarm_id.clone())
+            (
+                PlanGraphStatus::empty_for_swarm(swarm_id.clone()),
+                Vec::new(),
+            )
         }
     };
 
+    let agents = sessions.read().await.clone();
+    let members = swarm_members.read().await;
+    for (node_id, session_id) in assignments {
+        let Some(routing) = summary.node_routing.get_mut(&node_id) else {
+            continue;
+        };
+        // A durable pin is only a target. Read the initialized provider, or the
+        // verified in-memory startup snapshot while that live agent is busy.
+        routing.actual_execution =
+            agents
+                .get(&session_id)
+                .and_then(|agent| match agent.try_lock() {
+                    Ok(agent) => super::comm_session::initialized_swarm_execution(
+                        agent.provider_fork().as_ref(),
+                    )
+                    .ok(),
+                    Err(_) => members
+                        .get(&session_id)
+                        .and_then(|member| member.runtime.routing.as_ref())
+                        .and_then(|routing| routing.actual_execution.clone()),
+                });
+    }
     let _ = client_event_tx.send(ServerEvent::CommPlanStatusResponse { id, summary });
 }
 

@@ -380,6 +380,7 @@ fn test_comm_assign_next_roundtrip() -> Result<()> {
         id: 60,
         session_id: "sess_coord".to_string(),
         target_session: Some("sess_worker".to_string()),
+        task_id: None,
         working_dir: Some("/tmp/project".to_string()),
         prefer_spawn: Some(true),
         spawn_if_needed: Some(true),

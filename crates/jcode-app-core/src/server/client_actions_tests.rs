@@ -382,6 +382,7 @@ async fn enabling_swarm_does_not_auto_elect_coordinator() {
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         session_id.to_string(),
         crate::server::SwarmMember {
+            allowed_models: None,
             session_id: session_id.to_string(),
             event_tx: member_event_tx,
             event_txs: HashMap::new(),
@@ -489,6 +490,7 @@ async fn rename_session_event_uses_agent_session_id_even_when_client_id_is_stale
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         stale_client_session_id.to_string(),
         SwarmMember {
+            allowed_models: None,
             session_id: stale_client_session_id.to_string(),
             event_tx: member_event_tx,
             event_txs: HashMap::new(),
@@ -591,6 +593,7 @@ async fn notify_session_runs_scheduled_task_immediately_for_idle_live_session() 
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         session_id.clone(),
         SwarmMember {
+            allowed_models: None,
             session_id: session_id.clone(),
             event_tx: member_event_tx,
             event_txs: HashMap::new(),
@@ -709,6 +712,7 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
     let swarm_members = Arc::new(RwLock::new(HashMap::from([(
         session_id.clone(),
         SwarmMember {
+            allowed_models: None,
             session_id: session_id.clone(),
             event_tx: member_event_tx,
             event_txs: HashMap::new(),
@@ -795,6 +799,7 @@ async fn notify_session_queues_soft_interrupt_when_live_session_is_busy() {
 fn live_member(session_id: &str) -> (SwarmMember, mpsc::UnboundedReceiver<ServerEvent>) {
     let (attach_tx, attach_rx) = mpsc::unbounded_channel();
     let member = SwarmMember {
+        allowed_models: None,
         session_id: session_id.to_string(),
         event_tx: mpsc::unbounded_channel().0,
         event_txs: HashMap::from([("client-1".to_string(), attach_tx)]),

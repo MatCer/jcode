@@ -2738,6 +2738,7 @@ pub(super) async fn handle_client(
                     req_session_id,
                     &swarm_members,
                     &swarm_plans,
+                    &sessions,
                     &client_event_tx,
                 )
                 .await;
@@ -2818,6 +2819,7 @@ pub(super) async fn handle_client(
                 id,
                 session_id: req_session_id,
                 target_session,
+                task_id,
                 working_dir,
                 prefer_spawn,
                 spawn_if_needed,
@@ -2830,6 +2832,7 @@ pub(super) async fn handle_client(
                     id,
                     req_session_id,
                     target_session,
+                task_id,
                     working_dir,
                     prefer_spawn,
                     spawn_if_needed,

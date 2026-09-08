@@ -1,25 +1,28 @@
 <!--
-This file IS the swarm config. Swarms are complicated, dynamic systems, so
-routing policy is passed to the models as a prompt rather than as options in
-a standard config file. Edit freely: override globally at
-~/.jcode/swarm-prompt.md or per-project at ./.jcode/swarm-prompt.md.
+Task-to-model guidance is operator-tunable here or in project/global
+swarm-prompt.md overrides. Authorization remains server-side configuration.
 -->
 
-Model routing guidance for spawned swarm agents. Pass `model` to choose a model
-for newly spawned workers, including workers created by assignment or `run_plan`.
-An explicit model overrides `agents.swarm_model`. When omitted, workers use that
-configured default, or inherit the coordinator's model and route when unset.
-Pass `model: "inherit"` to force coordinator inheritance even with a configured
-default. Model selection does not change reused workers. Run `swarm list_models`
-to check available models/routes. Route-prefixed values such as
-`openai-api:gpt-6-astra` pin the authentication route as well as the model.
-Pass `effort` when spawning or assigning swarm work:
+Run `swarm list_models` to check effective policy and available routes. Explicit
+`model` requires `agents.swarm_model_selection = true`, which defaults off.
+When disabled, omit model, including the `inherit`/`coordinator` sentinels.
+When enabled, explicit worker/node model overrides `agents.swarm_model`; omission
+uses that default or the coordinator's effective identity if unset. `inherit`
+bypasses a default deliberately. Use existing route-prefixed selectors such as
+`openai-oauth:gpt-6-astra` when provider/authentication matters. Blank requests,
+ambiguous/unavailable routes, unsupported effort and node conflicts are errors.
 
-- Implementation tasks: `effort: "low"`.
-- Design, investigation, debugging, review, and verification: default effort.
-- Context fetching / bulk reading / summarization: `effort: "none"`.
-- Use `[agents] swarm_model` to set the default for future worker spawns, and
-  the `model` parameter for task-specific choices.
+Pass supported `effort` independently when a task needs an explicit setting.
+Node `model`/`effort` applies to graph seed, expansion and injected work. Reused
+workers must match; retry/resume/replacement retain the concrete execution pin.
+Verify actual initialized model, provider, API and effort in status rather than
+claiming the requested values were applied. Semantic task-to-model choice is
+orchestrator guidance, not a deterministic classifier.
+
+Root and nested deep coordinators inherit the same routing guidance and trusted
+policy. `allowed_models` may narrow a worker subtree, never broaden it. Omission
+inherits restrictions, while an empty list denies new execution. Do not change
+global config or prompts to work around a rejection.
 
 Structure guidance for spawned swarm agents:
 

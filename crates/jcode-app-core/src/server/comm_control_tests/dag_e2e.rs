@@ -808,7 +808,8 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
 #[tokio::test]
 async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
-    let mut fx = graph_fixture().await;
+    let mut fx = graph_fixture_named("swarm-rewake", "coord-rewake", "worker-rewake").await;
+    crate::session_effort::record_session_effort(&fx.coord, Some("swarm-deep"));
     // Two workers so auto-assignment has a choice; the planner should still win
     // the composite synthesis re-wake.
     let planner = "planner".to_string();
@@ -833,7 +834,7 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
         sessions.insert(other.clone(), test_agent().await);
     }
 
-    fx.seed("light", vec![node_spec("root", "explore", &[])])
+    fx.seed("deep", vec![node_spec("root", "explore", &[])])
         .await;
 
     // planner owns root and decomposes it into one child.
@@ -862,6 +863,12 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
     )
     .await;
 
+    while let Ok(event) = fx.client_rx.try_recv() {
+        assert!(
+            !matches!(event, ServerEvent::Error { .. }),
+            "expansion failed: {event:?}"
+        );
+    }
     // Planner recorded; root owner freed.
     {
         let plans = fx.swarm_plans.read().await;
@@ -886,7 +893,7 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
         4,
         other.clone(),
         "root.1".to_string(),
-        serde_json::json!({"findings": "child done"}).to_string(),
+        serde_json::json!({"findings": "child done", "confidence":"high", "what_i_did_not_check":["nothing, fully covered within this fixture"]}).to_string(),
         &fx.client_tx,
         &fx.swarm_members,
         &fx.swarms_by_id,
@@ -900,6 +907,36 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
     )
     .await;
 
+    // Deep expansion inserts a child-auditing gate. Synthesis is blocked until
+    // that independent gate is completed, rather than bypassing deep rigor.
+    let gate_id = {
+        let mut plans = fx.swarm_plans.write().await;
+        let plan = plans.get_mut(&fx.swarm_id).unwrap();
+        let gate_id = plan
+            .node_meta
+            .iter()
+            .find(|(_, meta)| meta.is_gate && meta.parent.as_deref() == Some("root"))
+            .map(|(id, _)| id.clone())
+            .expect("deep child gate");
+        let gate = plan.items.iter_mut().find(|i| i.id == gate_id).unwrap();
+        gate.status = "running".into();
+        gate.assigned_to = Some(other.clone());
+        gate_id
+    };
+    handle_comm_complete_node(
+        5, other.clone(), gate_id,
+        serde_json::json!({"findings":"Audited root.1; no gaps remain", "confidence":"high", "what_i_did_not_check":["nothing, fully covered within this fixture"]}).to_string(),
+        &fx.client_tx, &fx.swarm_members, &fx.swarms_by_id, &fx.swarm_plans,
+        &fx.swarm_coordinators, &fx.event_history, &fx.event_counter,
+        &fx.swarm_event_tx, &fx.sessions, &(Arc::new(TestProvider) as Arc<dyn Provider>),
+    ).await;
+    while let Ok(event) = fx.client_rx.try_recv() {
+        assert!(
+            !matches!(event, ServerEvent::Error { .. }),
+            "completion failed: {event:?}"
+        );
+    }
+
     // assign_next should route the composite synthesis back to the planner.
     let resolved = crate::server::comm_control::resolve_assignment_target_for_task_test_hook(
         &fx.coord,
@@ -910,6 +947,7 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
         &fx.swarm_plans,
     )
     .await;
+    crate::session_effort::forget_session_effort(&fx.coord);
     assert_eq!(resolved.as_deref(), Ok(planner.as_str()));
 }
 

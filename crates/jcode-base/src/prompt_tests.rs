@@ -198,6 +198,7 @@ fn agents_md_distinct_project_and_global_files_are_both_loaded() {
 
 #[test]
 fn captured_agents_md_keeps_split_prompt_stable_after_file_write() {
+    let _env = crate::storage::lock_test_env();
     let project_dir = tempfile::TempDir::new().unwrap();
     let agents_md = project_dir.path().join("AGENTS.md");
     std::fs::write(&agents_md, "original session instructions").unwrap();
@@ -468,12 +469,21 @@ fn test_swarm_prompt_prefers_project_then_global_then_default() {
 
     // No override files: built-in default.
     let prompt = load_swarm_prompt(Some(project_dir.path()));
-    assert_eq!(prompt, DEFAULT_SWARM_PROMPT.trim());
+    assert_eq!(
+        prompt,
+        format!(
+            "{SWARM_ROUTING_CONTRACT}\n\n{}",
+            DEFAULT_SWARM_PROMPT.trim()
+        )
+    );
 
     // Global override wins over the default.
     std::fs::write(temp.path().join("swarm-prompt.md"), "global swarm routing").unwrap();
     let prompt = load_swarm_prompt(Some(project_dir.path()));
-    assert_eq!(prompt, "global swarm routing");
+    assert_eq!(
+        prompt,
+        format!("{SWARM_ROUTING_CONTRACT}\n\nglobal swarm routing")
+    );
 
     // Project override wins over global.
     std::fs::create_dir_all(project_dir.path().join(".jcode")).unwrap();
@@ -483,12 +493,18 @@ fn test_swarm_prompt_prefers_project_then_global_then_default() {
     )
     .unwrap();
     let prompt = load_swarm_prompt(Some(project_dir.path()));
-    assert_eq!(prompt, "project swarm routing");
+    assert_eq!(
+        prompt,
+        format!("{SWARM_ROUTING_CONTRACT}\n\nproject swarm routing")
+    );
 
     // A blank project file falls through to global instead of going empty.
     std::fs::write(project_dir.path().join(".jcode/swarm-prompt.md"), "   \n").unwrap();
     let prompt = load_swarm_prompt(Some(project_dir.path()));
-    assert_eq!(prompt, "global swarm routing");
+    assert_eq!(
+        prompt,
+        format!("{SWARM_ROUTING_CONTRACT}\n\nglobal swarm routing")
+    );
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
@@ -658,4 +674,30 @@ fn project_system_prompt_file_replaces_default_base_prompt() {
     assert_eq!(load_base_system_prompt(Some(&dir)), DEFAULT_SYSTEM_PROMPT);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn routing_default_prompt_requires_opt_in_and_nested_policy() {
+    assert!(DEFAULT_SWARM_PROMPT.contains("swarm_model_selection"));
+    assert!(DEFAULT_SWARM_PROMPT.contains("allowed_models"));
+    assert!(DEFAULT_SWARM_PROMPT.contains("actual"));
+    assert!(DEFAULT_SWARM_PROMPT.contains("nested"));
+}
+
+#[test]
+fn routing_nested_prompt_composition_keeps_operator_guidance_and_runtime_contract() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".jcode")).unwrap();
+    std::fs::write(
+        project.path().join(".jcode/swarm-prompt.md"),
+        "Use our task-specific routing guidance.",
+    )
+    .unwrap();
+    let root = load_swarm_prompt(Some(project.path()));
+    let nested = load_swarm_prompt(Some(project.path()));
+    assert_eq!(root, nested);
+    assert!(nested.contains("Use our task-specific routing guidance."));
+    assert!(nested.contains("agents.swarm_model_selection"));
+    assert!(nested.contains("allowed_models"));
+    assert!(nested.contains("actual"));
 }

@@ -25,16 +25,15 @@ async fn communicate_list_and_await_members_work_end_to_end() {
     let mut watcher = RawClient::connect(&socket_path)
         .await
         .expect("watcher should connect");
-    let mut peer = RawClient::connect(&socket_path)
-        .await
-        .expect("peer should connect");
     watcher
         .subscribe(&repo_dir)
         .await
         .expect("watcher subscribe");
-    peer.subscribe(&repo_dir).await.expect("peer subscribe");
 
     let watcher_session = watcher.session_id().await.expect("watcher session id");
+    let mut peer = spawn_attached_peer(&socket_path, &watcher_session, &repo_dir)
+        .await
+        .expect("peer should spawn and attach");
     let peer_session = peer.session_id().await.expect("peer session id");
 
     let tool = CommunicateTool::new();
@@ -153,16 +152,15 @@ async fn communicate_await_members_background_returns_immediately_and_notifies()
     let mut watcher = RawClient::connect(&socket_path)
         .await
         .expect("watcher should connect");
-    let mut peer = RawClient::connect(&socket_path)
-        .await
-        .expect("peer should connect");
     watcher
         .subscribe(&repo_dir)
         .await
         .expect("watcher subscribe");
-    peer.subscribe(&repo_dir).await.expect("peer subscribe");
 
     let watcher_session = watcher.session_id().await.expect("watcher session id");
+    let mut peer = spawn_attached_peer(&socket_path, &watcher_session, &repo_dir)
+        .await
+        .expect("peer should spawn and attach");
     let peer_session = peer.session_id().await.expect("peer session id");
 
     let tool = CommunicateTool::new();
@@ -310,16 +308,15 @@ async fn communicate_status_returns_busy_snapshot_for_running_member() {
     let mut watcher = RawClient::connect(&socket_path)
         .await
         .expect("watcher should connect");
-    let mut peer = RawClient::connect(&socket_path)
-        .await
-        .expect("peer should connect");
     watcher
         .subscribe(&repo_dir)
         .await
         .expect("watcher subscribe");
-    peer.subscribe(&repo_dir).await.expect("peer subscribe");
 
     let watcher_session = watcher.session_id().await.expect("watcher session id");
+    let mut peer = spawn_attached_peer(&socket_path, &watcher_session, &repo_dir)
+        .await
+        .expect("peer should spawn and attach");
     let peer_session = peer.session_id().await.expect("peer session id");
     let tool = CommunicateTool::new();
     let ctx = test_ctx(&watcher_session, &repo_dir);
@@ -415,6 +412,9 @@ async fn communicate_spawn_reports_completion_back_to_spawner() {
         .expect("spawn with prompt should succeed");
     let spawned_session = spawn_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Spawned new agent: ")
         .expect("spawn output should include session id")
         .trim()
@@ -493,6 +493,9 @@ async fn communicate_spawn_with_prompt_and_summary_work_end_to_end() {
         .expect("spawn with prompt should succeed");
     let spawned_session = spawn_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Spawned new agent: ")
         .expect("spawn output should include session id")
         .trim()
@@ -572,13 +575,12 @@ async fn communicate_message_routes_as_dm_while_broadcast_targets_swarm() {
     let mut sender = RawClient::connect(&socket_path)
         .await
         .expect("sender should connect");
-    let mut peer = RawClient::connect(&socket_path)
-        .await
-        .expect("peer should connect");
     sender.subscribe(&repo_dir).await.expect("sender subscribe");
-    peer.subscribe(&repo_dir).await.expect("peer subscribe");
 
     let sender_session = sender.session_id().await.expect("sender session id");
+    let mut peer = spawn_attached_peer(&socket_path, &sender_session, &repo_dir)
+        .await
+        .expect("peer should spawn and attach");
     let peer_session = peer.session_id().await.expect("peer session id");
 
     // Ensure both sessions are part of the same swarm before messaging.

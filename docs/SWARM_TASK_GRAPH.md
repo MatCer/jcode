@@ -13,6 +13,57 @@ guarantees, the bias budget, and the tool surface, based on the design discussio
 
 ---
 
+## Opt-in node execution constraints
+
+With operator `agents.swarm_model_selection = true`, each `nodes` entry in
+`task_graph`, `expand_node`, or `inject_gap` accepts optional `model` and `effort`:
+
+```json
+{
+  "action": "task_graph",
+  "mode": "light",
+  "nodes": [
+    {"id": "implement", "content": "Implement the scoped change", "model": "openai-oauth:gpt-6-astra", "effort": "medium"},
+    {"id": "review", "content": "Independently review the change", "depends_on": ["implement"], "model": "claude-oauth:claude-opus-5", "effort": "high"}
+  ]
+}
+```
+
+These are illustrative catalog routes, not an assurance of local credentials or
+provider support. With selection disabled, omit `model` everywhere. Existing
+requests and graphs deserialize with no explicit choice. See
+[the routing contract](SWARM_ARCHITECTURE.md#opt-in-worker-routing).
+
+A node choice is authoritative. `assign_task`, `assign_next`, `fill_slots`, and
+`run_plan` cannot overwrite it with conflicting call-level model/effort. Assignment
+selects a compatible initialized worker or uses the same server-admitted spawn
+path. `assign_task` with an exact task id uses that path for automatic spawning,
+never a client-side unconstrained spawn/reassignment pair. An exact id must exist
+and be runnable/unassigned before spawning. No compatible worker with spawning
+disabled is a routing-blocked error, not an empty queue or successful progress.
+
+The first assignment pins concrete model, provider key, API method and actual
+effort. Retry, reassign, replace, resume, composite synthesis re-wake and durable
+restore retain the pin. Tightened operator policy can block a retry. It cannot
+silently substitute a different route. `plan_status` includes pending requests,
+pinned targets and separately verified actual identities. A persisted target
+without an initialized worker is not actual-execution evidence.
+
+Descendants inherit trusted policy snapshots. New children and automatically
+inserted gates keep ancestry restrictions even after the original author leaves.
+`allowed_models` on worker spawn/assignment can narrow a subtree but cannot
+broaden it. Caller-supplied resolved/actual execution or node-policy metadata is
+not trusted graph input. Existing legacy plan updates preserve node pins. Legacy
+proposals whose author/provenance cannot be verified fail closed: re-propose from
+a live authorized member, then approve. No separate trusted proposal-policy map
+is maintained.
+
+There is no general route-edit API for an already pinned node. A conflicting
+assignment is not an edit. Retain that node's history, use the supported graph
+seed/expand/gap workflow to create a new node id with the intended constraints,
+and connect dependencies deliberately. Do not strip persistence metadata or
+rename a conflicting request to disguise a retry.
+
 ## 1. Motivation and core reframe
 
 Today swarm is **agent-first**: you drive work by spawning agents and talking to

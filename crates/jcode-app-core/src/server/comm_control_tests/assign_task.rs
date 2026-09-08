@@ -5,7 +5,10 @@ async fn assign_task_without_task_id_picks_highest_priority_runnable_task() {
     let requester = "coord";
     let worker = "worker";
     let (client_tx, mut client_rx) = mpsc::unbounded_channel();
-    let sessions = Arc::new(RwLock::new(HashMap::new()));
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        worker.to_string(),
+        test_agent().await,
+    )])));
     let soft_interrupt_queues = Arc::new(RwLock::new(HashMap::new()));
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
     let swarm_members = Arc::new(RwLock::new(HashMap::from([
@@ -119,7 +122,10 @@ async fn assign_task_marks_completed_worker_queued_before_returning() {
     let requester = "coord";
     let worker = "worker-completed";
     let (client_tx, mut client_rx) = mpsc::unbounded_channel();
-    let sessions = Arc::new(RwLock::new(HashMap::new()));
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        worker.to_string(),
+        test_agent().await,
+    )])));
     let soft_interrupt_queues = Arc::new(RwLock::new(HashMap::new()));
     let client_connections = Arc::new(RwLock::new(HashMap::new()));
     let swarm_members = Arc::new(RwLock::new(HashMap::from([

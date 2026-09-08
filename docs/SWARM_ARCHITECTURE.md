@@ -17,6 +17,65 @@ coordinate, plan, communicate, and integrate work with optional git worktrees.
 - Optional git worktrees used only when they make sense.
 - Integration handled by worktree managers, not the coordinator.
 
+## Opt-in worker routing
+
+Per-worker and per-node routing is operator-controlled and **defaults off**.
+`[agents] swarm_model_selection = true` enables explicit `model` choices. With
+it off, omit `model`: the existing `swarm_model` default, then coordinator
+inheritance, is unchanged. An explicit model now returns an actionable error
+instead of the old ignored-argument warning. This is a deliberate compatibility
+change, including `inherit` and `coordinator` requests.
+
+When enabled, precedence is explicit worker/node model, then `agents.swarm_model`,
+then the requesting coordinator's effective provider/model identity. `inherit`
+(or `coordinator`) explicitly bypasses a configured default. Blank model or
+explicit effort is an error, not omission. Effort is independent of model
+selection. For new workers, effort precedence is explicit node/worker effort,
+then `agents.swarm_effort`, then inherited provider effort. Existing node pins
+remain authoritative on later execution. Unsupported explicit settings fail
+rather than being reported as applied.
+
+`swarm list_models` reports whether selection is enabled, effective restrictions,
+and available catalog routes. Use the existing **prefix:model** syntax, such as
+`openai-oauth:gpt-6-astra`, `openai-api:gpt-6-astra`,
+`claude-oauth:claude-opus-5`, or `claude-api:claude-opus-5`, only when that route is
+available. Do not invent `model@provider` syntax. Bare model selectors permit any
+available route for that normalized model, but ambiguous explicit selections
+fail with route choices. Use the catalog's route-qualified selector when the
+provider/authentication method matters, including configured compatible profiles.
+Aliases normalize before matching. Unknown, forbidden, unavailable, ambiguous,
+and initialization-failed selections are errors, not fallback successes.
+
+The optional `[agents] swarm_allowed_models` list limits new execution:
+
+- Absent means no additional operator model restriction beyond availability.
+- `[]` permits no new execution, including configured/inherited defaults.
+- A nonempty list permits only matching exact models or route-qualified selectors.
+- `allowed_models` on spawn/assignment narrows the new worker subtree. Omission
+  inherits restrictions. Empty denies execution. A descendant cannot broaden its
+  inherited policy, even by supplying caller-controlled role or root metadata.
+
+The server derives authorization from trusted ancestry and persists restrictions
+on workers and DAG nodes. Node policy survives author cleanup, retries, and
+restore. Current operator policy is rechecked before new execution. Tightening
+can block a pinned route but never silently replace it or kill already-running
+workers. Normal/light spawning remains root-only. Deep descendants can route
+children within their inherited restrictions. This is routing authorization,
+not a sandbox against an agent with unrestricted shell/config-edit access.
+
+Spawn, assignment, task control, member status and plan status distinguish
+**requested**, durable **pinned**, and verified **actual** provider/model/API/
+effort. Unknown actual execution is not success evidence. Idle-worker reuse must
+match the node's route and explicit effort. A spawn nonce reused with conflicting
+routing fails rather than returning a different execution as a success.
+
+Routing guidance comes from the existing swarm-prompt composition for both root
+and nested coordinators: project `.jcode/swarm-prompt.md`, global
+`~/.jcode/swarm-prompt.md`, then built-in guidance. The server enforces an explicit
+choice or rejects it. It does not guarantee that an LLM chooses the best model
+for a semantic task category, and no private model-role table is compiled into
+Rust. See [operator activation](SWARM_MODEL_ROUTING.md) before deployment.
+
 ## Roles
 
 ### Mode-gated spawning

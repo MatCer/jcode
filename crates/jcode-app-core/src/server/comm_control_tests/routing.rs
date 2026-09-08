@@ -530,10 +530,20 @@ async fn routing_next(
     spawn: bool,
     model: Option<&str>,
 ) {
+    routing_next_exact(fx, provider, spawn, model, None).await;
+}
+async fn routing_next_exact(
+    fx: &GraphFixture,
+    provider: &Arc<dyn Provider>,
+    spawn: bool,
+    model: Option<&str>,
+    task_id: Option<&str>,
+) {
     handle_comm_assign_next(
         103,
         fx.coord.clone(),
         None,
+        task_id.map(str::to_string),
         None,
         Some(false),
         Some(spawn),
@@ -786,4 +796,144 @@ async fn routing_stranded_reclaim_waits_for_admission_and_preserves_pin_and_cap(
         plan.node_meta["task"].resolved_execution.as_ref(),
         Some(&pin)
     );
+}
+
+#[tokio::test]
+async fn routing_exact_next_selects_requested_node_not_earlier_ready_node() {
+    let _env = RoutingConfigGuard::new();
+    let (fx, provider) = routing_fixture("routing-exact-next").await;
+    routing_seed(
+        &fx,
+        &provider,
+        vec![
+            routed_spec("a", "gpt-6-astra"),
+            routed_spec("b", "gpt-6-astra"),
+        ],
+    )
+    .await;
+    routing_next_exact(&fx, &provider, true, None, Some("b")).await;
+    let plans = fx.swarm_plans.read().await;
+    let plan = &plans[&fx.swarm_id];
+    assert!(
+        plan.items
+            .iter()
+            .find(|n| n.id == "a")
+            .unwrap()
+            .assigned_to
+            .is_none()
+    );
+    assert_eq!(
+        plan.items
+            .iter()
+            .find(|n| n.id == "b")
+            .unwrap()
+            .assigned_to
+            .as_deref(),
+        Some(fx.worker.as_str())
+    );
+    assert_eq!(
+        plan.node_meta["b"]
+            .resolved_execution
+            .as_ref()
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("medium")
+    );
+}
+
+#[tokio::test]
+async fn routing_exact_next_rejects_missing_blank_and_blocked_before_spawn_or_claim() {
+    let _env = RoutingConfigGuard::new();
+    let (mut fx, provider) = routing_fixture("routing-exact-invalid").await;
+    let mut blocked = routed_spec("blocked", "gpt-6-astra");
+    blocked.depends_on = vec!["a".into()];
+    routing_seed(
+        &fx,
+        &provider,
+        vec![routed_spec("a", "gpt-6-astra"), blocked],
+    )
+    .await;
+    let members = fx.swarm_members.read().await.len();
+    for task in ["missing", "  ", "blocked"] {
+        routing_next_exact(&fx, &provider, true, None, Some(task)).await;
+        let error = routing_drain_error(&mut fx);
+        assert!(error.contains("task") || error.contains("Task"), "{error}");
+        assert_eq!(fx.swarm_members.read().await.len(), members);
+        let plans = fx.swarm_plans.read().await;
+        let plan = &plans[&fx.swarm_id];
+        assert!(plan.items.iter().all(|n| n.assigned_to.is_none()));
+        assert!(
+            plan.node_meta
+                .values()
+                .all(|n| n.resolved_execution.is_none())
+        );
+    }
+    routing_next_exact(&fx, &provider, true, None, Some("a")).await;
+    let before = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+    routing_next_exact(&fx, &provider, true, None, Some("a")).await;
+    assert!(routing_drain_error(&mut fx).contains("must be runnable and unassigned"));
+    assert_eq!(fx.swarm_members.read().await.len(), members);
+    let after = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+    assert_eq!(before.items, after.items);
+    assert_eq!(before.node_meta, after.node_meta);
+}
+
+#[tokio::test]
+async fn routing_plan_status_reports_verified_runtime_not_just_pinned_target() {
+    let _env = RoutingConfigGuard::new();
+    let (mut fx, provider) = routing_fixture("routing-plan-observed").await;
+    routing_seed(&fx, &provider, vec![routed_spec("task", "gpt-6-astra")]).await;
+    routing_assign(&fx, &provider, "task", None, None, None).await;
+    super::super::comm_sync::handle_comm_plan_status(
+        901,
+        fx.coord.clone(),
+        &fx.swarm_members,
+        &fx.swarm_plans,
+        &fx.sessions,
+        &fx.client_tx,
+    )
+    .await;
+    let mut observed = None;
+    while let Ok(event) = fx.client_rx.try_recv() {
+        if let ServerEvent::CommPlanStatusResponse { id: 901, summary } = event {
+            observed = Some(summary);
+        }
+    }
+    let routing = observed.unwrap().node_routing.remove("task").unwrap();
+    assert_eq!(
+        routing
+            .actual_execution
+            .as_ref()
+            .map(|route| route.model.as_str()),
+        Some("gpt-6-astra")
+    );
+    assert_eq!(
+        routing
+            .actual_execution
+            .as_ref()
+            .and_then(|route| route.effort.as_deref()),
+        Some("medium")
+    );
+}
+
+#[tokio::test]
+async fn routing_uninitialized_metadata_candidate_cannot_claim_node() {
+    let _env = RoutingConfigGuard::new();
+    let (mut fx, provider) = routing_fixture("routing-missing-runtime").await;
+    routing_seed(&fx, &provider, vec![routed_spec("task", "gpt-6-astra")]).await;
+    fx.sessions.write().await.remove(&fx.worker);
+    routing_assign(&fx, &provider, "task", Some(fx.worker.clone()), None, None).await;
+    let error = routing_drain_error(&mut fx);
+    assert!(error.contains("routing blocked:"), "{error}");
+    let plans = fx.swarm_plans.read().await;
+    let plan = &plans[&fx.swarm_id];
+    assert!(plan.items[0].assigned_to.is_none());
+    assert!(plan.node_meta["task"].resolved_execution.is_none());
+    assert!(plan.task_progress.is_empty());
+    assert!(super::try_claim_auto_assign_target(
+        &fx.swarm_id,
+        &fx.worker
+    ));
+    super::release_auto_assign_claim(&fx.swarm_id, &fx.worker);
 }

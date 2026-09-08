@@ -2236,6 +2236,7 @@ pub(super) async fn handle_comm_assign_next(
     id: u64,
     req_session_id: String,
     target_session: Option<String>,
+    task_id: Option<String>,
     working_dir: Option<String>,
     prefer_spawn: Option<bool>,
     spawn_if_needed: Option<bool>,
@@ -2272,15 +2273,49 @@ pub(super) async fn handle_comm_assign_next(
     else {
         return;
     };
-    let Some(selected_task_id) =
-        next_runnable_task_id_reclaiming_stranded(&swarm_id, swarm_plans, swarm_members).await
-    else {
-        let _ = client_event_tx.send(ServerEvent::Error {
-            id,
-            message: "No runnable unassigned tasks are available in the swarm plan".into(),
-            retry_after_secs: None,
-        });
-        return;
+    let selected_task_id = if let Some(task_id) = task_id {
+        let task_id = task_id.trim();
+        let plans = swarm_plans.read().await;
+        let plan = plans.get(&swarm_id);
+        let task = plan.and_then(|plan| plan.items.iter().find(|item| item.id == task_id));
+        let error = if task_id.is_empty() {
+            Some("Exact task_id must not be blank".to_string())
+        } else if task.is_none() {
+            Some(format!("Task '{task_id}' not found in swarm plan"))
+        } else if task.is_some_and(|item| item.assigned_to.is_some())
+            || !plan.is_some_and(|plan| {
+                crate::plan::next_runnable_item_ids(&plan.items, None)
+                    .iter()
+                    .any(|id| id == task_id)
+            })
+        {
+            Some(format!(
+                "Task '{task_id}' must be runnable and unassigned before automatic assignment; inspect plan_status or use task control"
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = error {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message,
+                retry_after_secs: None,
+            });
+            return;
+        }
+        task_id.to_string()
+    } else {
+        let Some(task_id) =
+            next_runnable_task_id_reclaiming_stranded(&swarm_id, swarm_plans, swarm_members).await
+        else {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "No runnable unassigned tasks are available in the swarm plan".into(),
+                retry_after_secs: None,
+            });
+            return;
+        };
+        task_id
     };
     let meta = swarm_plans
         .read()

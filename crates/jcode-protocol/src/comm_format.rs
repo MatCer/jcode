@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     AgentInfo, AgentStatusSnapshot, AwaitedMemberStatus, ContextEntry, HistoryMessage,
-    PlanGraphStatus, SwarmChannelInfo, ToolCallSummary,
+    PlanGraphStatus, SwarmChannelInfo, SwarmRoutingStatus, ToolCallSummary,
 };
 
 pub fn format_comm_plan_followup(summary: &PlanGraphStatus) -> String {
@@ -358,6 +358,35 @@ pub fn format_comm_tool_summary(target: &str, calls: &[ToolCallSummary]) -> Stri
     }
 }
 
+/// Format server-observed routing without treating a requested/pinned target as
+/// proof of initialization. Shared by tool responses and status projections.
+pub fn format_comm_routing_status(routing: &SwarmRoutingStatus) -> String {
+    let mut output = String::new();
+    if let Some(model) = routing.requested_model.as_deref() {
+        output.push_str(&format!("  Requested model: {model}\n"));
+    }
+    if let Some(effort) = routing.requested_effort.as_deref() {
+        output.push_str(&format!("  Requested effort: {effort}\n"));
+    }
+    for (label, execution) in [
+        ("Pinned execution", routing.resolved_execution.as_ref()),
+        ("Actual execution", routing.actual_execution.as_ref()),
+    ] {
+        if let Some(execution) = execution {
+            output.push_str(&format!(
+                "  {label}: {} provider={} api={} effort={}\n",
+                execution.model,
+                execution.provider_key,
+                execution.api_method,
+                execution.effort.as_deref().unwrap_or("unknown"),
+            ));
+        } else if label == "Actual execution" {
+            output.push_str("  Actual execution: unknown (not verified)\n");
+        }
+    }
+    output
+}
+
 pub fn format_comm_status_snapshot(snapshot: &AgentStatusSnapshot) -> String {
     let target = snapshot
         .friendly_name
@@ -416,6 +445,10 @@ pub fn format_comm_status_snapshot(snapshot: &AgentStatusSnapshot) -> String {
         let provider = snapshot.provider_name.as_deref().unwrap_or("unknown");
         let model = snapshot.provider_model.as_deref().unwrap_or("unknown");
         output.push_str(&format!("  Provider: {} / {}\n", provider, model));
+    }
+
+    if let Some(routing) = snapshot.routing.as_ref() {
+        output.push_str(&format_comm_routing_status(routing));
     }
 
     if snapshot.files_touched.is_empty() {
@@ -514,6 +547,10 @@ pub fn format_comm_plan_status(summary: &PlanGraphStatus) -> String {
         ));
     }
 
+    for (node, routing) in &summary.node_routing {
+        output.push_str(&format!("  Routing for {node}:\n"));
+        output.push_str(&format_comm_routing_status(routing));
+    }
     output
 }
 
@@ -697,5 +734,54 @@ mod truncation_tests {
         }];
         let out = format_comm_context_history("worker", &messages);
         assert!(out.contains("[user]"));
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn routing_status_distinguishes_pinned_from_actual_execution() {
+        let mut snapshot: AgentStatusSnapshot = serde_json::from_value(json!({
+            "session_id": "worker", "routing": {
+                "requested_model": "openai-api:gpt-6-astra", "requested_effort": "medium",
+                "resolved_execution": {"model":"gpt-6-astra", "provider_key":"openai", "provider_label":"OpenAI", "api_method":"openai-api-key", "effort":"medium"}
+            }
+        })).unwrap();
+        let output = format_comm_status_snapshot(&snapshot);
+        assert!(
+            output.contains("Requested model: openai-api:gpt-6-astra"),
+            "{output}"
+        );
+        assert!(output.contains("Pinned execution: gpt-6-astra"), "{output}");
+        assert!(output.contains("Actual execution: unknown"), "{output}");
+        let routing = snapshot.routing.as_mut().unwrap();
+        routing.actual_execution = routing.resolved_execution.clone();
+        let output = format_comm_status_snapshot(&snapshot);
+        assert!(output.contains("Actual execution: gpt-6-astra"), "{output}");
+        assert!(
+            output.contains("provider=openai api=openai-api-key effort=medium"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn routing_plan_status_includes_pending_requested_route_without_claiming_actual() {
+        let summary: PlanGraphStatus = serde_json::from_value(json!({
+            "version":1,"item_count":1,"node_routing": {
+                "review": {"requested_model":"claude-opus-5","requested_effort":"high"}
+            }
+        }))
+        .unwrap();
+        let output = format_comm_plan_status(&summary);
+        assert!(output.contains("Routing for review"), "{output}");
+        assert!(
+            output.contains("Requested model: claude-opus-5"),
+            "{output}"
+        );
+        assert!(output.contains("Requested effort: high"), "{output}");
+        assert!(output.contains("Actual execution: unknown"), "{output}");
     }
 }

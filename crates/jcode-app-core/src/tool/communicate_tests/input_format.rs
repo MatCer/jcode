@@ -396,6 +396,7 @@ fn format_awaited_members_disambiguates_duplicate_friendly_names() {
 #[test]
 fn format_status_snapshot_includes_activity_and_metadata() {
     let output = super::format_status_snapshot(&AgentStatusSnapshot {
+        routing: None,
         session_id: "sess-peer".to_string(),
         friendly_name: Some("bear".to_string()),
         swarm_id: Some("swarm-test".to_string()),
@@ -429,9 +430,9 @@ fn format_status_snapshot_includes_activity_and_metadata() {
     assert!(output.output.contains("Activity: busy (bash)"));
     assert!(output.output.contains("Swarm: swarm-test"));
     assert!(
-        output
-            .output
-            .contains("Meta: headless · attachments=0 · active=3s ago · status_age=7s · joined=42s")
+        output.output.contains(
+            "Meta: headless · attachments=0 · active=3s ago · status_age=7s · joined=42s"
+        )
     );
     assert!(output.output.contains("Files: src/server/comm_sync.rs"));
 }

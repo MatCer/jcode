@@ -180,8 +180,9 @@ async fn assign_task_does_not_stack_on_busy_worker() {
     match client_rx.recv().await.expect("response") {
         ServerEvent::Error { message, .. } => {
             assert!(
-                message.starts_with("No ready or completed swarm agents are available"),
-                "expected the spawn-fallback trigger, got: {message}"
+                message.contains("routing blocked:")
+                    && message.contains("No compatible initialized worker"),
+                "expected busy-worker routing refusal, got: {message}"
             );
         }
         other => panic!("expected Error refusing to stack, got {other:?}"),

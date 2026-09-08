@@ -71,8 +71,8 @@ async fn communicate_assign_task_can_spawn_fallback_agent() {
         .expect("assign_task should spawn a fallback worker");
 
     assert!(
-        assign_output.output.contains("spawned automatically"),
-        "expected fallback spawn in output, got: {}",
+        assign_output.output.contains("Actual execution:"),
+        "expected server routing observation in output, got: {}",
         assign_output.output
     );
     assert!(
@@ -83,8 +83,10 @@ async fn communicate_assign_task_can_spawn_fallback_agent() {
 
     let spawned_session = assign_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Task 'task-a' assigned to ")
-        .and_then(|rest| rest.strip_suffix(" (spawned automatically)"))
         .expect("assign output should include spawned session id")
         .trim()
         .to_string();
@@ -169,6 +171,9 @@ async fn communicate_assign_next_assigns_next_runnable_task() {
         .expect("worker spawn should succeed");
     let worker_session = spawn_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Spawned new agent: ")
         .expect("spawn output should include session id")
         .trim()
@@ -274,6 +279,9 @@ async fn communicate_assign_next_can_prefer_fresh_spawn_server_side() {
         .expect("existing worker spawn should succeed");
     let existing_worker = existing_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Spawned new agent: ")
         .expect("spawn output should include session id")
         .trim()
@@ -310,6 +318,9 @@ async fn communicate_assign_next_can_prefer_fresh_spawn_server_side() {
 
     let preferred_session = assign_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Task 'task-c' assigned to ")
         .expect("assign_next output should include session id")
         .trim()
@@ -401,6 +412,9 @@ async fn communicate_assign_next_can_spawn_if_needed_server_side() {
 
     let spawned_session = assign_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Task 'task-d' assigned to ")
         .expect("assign_next output should include session id")
         .trim()
@@ -567,6 +581,9 @@ async fn communicate_assign_task_can_prefer_fresh_spawn_over_reuse() {
         .expect("existing reusable worker should spawn");
     let existing_worker = existing_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Spawned new agent: ")
         .expect("spawn output should include session id")
         .trim()
@@ -602,9 +619,7 @@ async fn communicate_assign_task_can_prefer_fresh_spawn_over_reuse() {
         .expect("assign_task with prefer_spawn should succeed");
 
     assert!(
-        assign_output
-            .output
-            .contains("spawned by planner preference"),
+        assign_output.output.contains("Actual execution:"),
         "expected planner-preference spawn in output, got: {}",
         assign_output.output
     );
@@ -616,8 +631,10 @@ async fn communicate_assign_task_can_prefer_fresh_spawn_over_reuse() {
 
     let preferred_session = assign_output
         .output
+        .lines()
+        .next()
+        .expect("response summary line")
         .strip_prefix("Task 'task-b' assigned to ")
-        .and_then(|rest| rest.strip_suffix(" (spawned by planner preference)"))
         .expect("assign output should include preferred spawned session id")
         .trim()
         .to_string();
