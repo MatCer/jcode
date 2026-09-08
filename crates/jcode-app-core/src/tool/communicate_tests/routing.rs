@@ -229,8 +229,12 @@ async fn routing_public_tool_exact_node_spawn_status_policy_and_driver_failures(
     let _runtime = EnvGuard::set("JCODE_RUNTIME_DIR", home.path());
     let _socket = EnvGuard::set("JCODE_SOCKET", &socket);
     let _debug = EnvGuard::set("JCODE_DEBUG_CONTROL", "1");
-    std::fs::write(home.path().join("config.toml"), "[agents]\nswarm_model_selection = true\nswarm_model = \"gpt-6-astra\"\nswarm_allowed_models = [\"gpt-6-astra\", \"gpt-5.6-sol\"]\n").unwrap();
+    // Keep this provider-double fixture offline. Cold memory retrieval otherwise
+    // downloads embeddings while the server sampler waits on its cache mutex,
+    // blocking this current-thread runtime before the provider stream can finish.
+    std::fs::write(home.path().join("config.toml"), "[features]\nmemory = false\n[agents]\nswarm_model_selection = true\nswarm_model = \"gpt-6-astra\"\nswarm_allowed_models = [\"gpt-6-astra\", \"gpt-5.6-sol\"]\n").unwrap();
     crate::config::invalidate_config_cache();
+    assert!(!crate::config::config().features.memory);
     let server = Arc::new(Server::new(Arc::new(PublicRoutingProvider::new())));
     let mut server_task = tokio::spawn(async move { server.run().await });
     wait_for_server_socket(&socket, &mut server_task)
@@ -326,7 +330,9 @@ async fn routing_public_tool_exact_node_spawn_status_policy_and_driver_failures(
                 .unwrap();
             if idle.output.contains(
                 "Actual execution: gpt-5.6-sol provider=openai-oauth api=openai-oauth effort=high",
-            ) {
+            ) && idle.output.contains("Activity: idle")
+            {
+                eprintln!("Verified idle routing observation:\n{}", idle.output);
                 break;
             }
             last_status = idle.output;
