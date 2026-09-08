@@ -113,11 +113,7 @@ pub(super) async fn create_routed_headless_session(
     let provider = provider_template.fork();
     if let Some(status) = routing.as_ref() {
         if let Some(target) = status.resolved_execution.as_ref() {
-            super::comm_session::initialize_swarm_provider(
-                provider.as_ref(),
-                target,
-                status.requested_effort.as_deref(),
-            )?;
+            super::comm_session::initialize_swarm_provider(provider.as_ref(), target, true)?;
         }
     }
     let registry = Registry::new(provider.clone()).await;
@@ -212,6 +208,10 @@ pub(super) async fn create_routed_headless_session(
         }
     }
 
+    let effort_override = match routing.as_ref().and_then(|r| r.resolved_execution.as_ref()) {
+        Some(target) => target.effort.clone(),
+        None => effort_override,
+    };
     if let Some(effort) = effort_override
         .as_deref()
         .map(str::trim)
@@ -220,7 +220,8 @@ pub(super) async fn create_routed_headless_session(
     {
         if routing
             .as_ref()
-            .is_some_and(|r| r.requested_effort.is_some())
+            .is_some_and(|r| r.resolved_execution.is_some() || r.requested_effort.is_some())
+            && provider.reasoning_effort().as_deref() != Some(effort)
         {
             return Err(e);
         }
@@ -231,12 +232,14 @@ pub(super) async fn create_routed_headless_session(
     }
 
     if let Some(status) = routing.as_mut() {
+        // Capture inherited/unchangeable effort in the session too. Providers may
+        // reject a redundant setter while already matching the durable pin.
+        new_agent.restore_reasoning_effort_from_session();
         let actual_provider = new_agent.provider_fork();
         status.actual_execution = match status.resolved_execution.as_ref() {
             Some(target) => Some(super::comm_session::verify_swarm_execution(
                 actual_provider.as_ref(),
                 target,
-                status.requested_effort.as_deref(),
             )?),
             None => {
                 if let Some(effort) = status.requested_effort.as_deref() {

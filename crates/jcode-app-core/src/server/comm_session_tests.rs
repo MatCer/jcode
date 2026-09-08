@@ -20,6 +20,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
+#[path = "comm_session_effort_tests.rs"]
+mod effort_tests;
+
 // Callers hold the shared process-environment lock. Restore even after panic.
 struct TestHome(Option<std::ffi::OsString>);
 impl TestHome {
@@ -1429,17 +1432,18 @@ fn routing_initialized_identity_never_substitutes_requested_provider_or_effort()
     let observed = super::initialized_swarm_execution(&actual).unwrap();
     assert_eq!(observed.provider_key, "openai-api-key");
     assert_eq!(observed.effort.as_deref(), Some("medium"));
-    assert!(super::verify_swarm_execution(&actual, &expected, None).is_err());
-    assert!(super::initialize_swarm_provider(&actual, &expected, None).is_err());
+    assert!(super::verify_swarm_execution(&actual, &expected).is_err());
+    assert!(super::initialize_swarm_provider(&actual, &expected, true).is_err());
     expected = super::execution_for_route(&routing_catalog()[1], Some("high".into()));
-    assert!(super::verify_swarm_execution(&actual, &expected, Some("high")).is_err());
-    assert!(super::initialize_swarm_provider(&actual, &expected, Some("high")).is_err());
-    assert!(super::verify_swarm_execution(&actual, &expected, Some("medium")).is_ok());
+    assert!(super::verify_swarm_execution(&actual, &expected).is_err());
+    assert!(super::initialize_swarm_provider(&actual, &expected, true).is_err());
+    expected.effort = Some("medium".into());
+    assert!(super::verify_swarm_execution(&actual, &expected).is_ok());
     let failing = RoutingProbe {
         fail_switch: true,
         ..actual
     };
-    assert!(super::initialize_swarm_provider(&failing, &expected, None).is_err());
+    assert!(super::initialize_swarm_provider(&failing, &expected, true).is_err());
 }
 
 #[test]

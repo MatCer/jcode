@@ -22,7 +22,6 @@ use jcode_plan::ResolvedExecution;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
-use std::time::Instant;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
@@ -506,7 +505,6 @@ pub(super) fn initialized_swarm_execution(
 pub(super) fn verify_swarm_execution(
     provider: &dyn Provider,
     expected: &ResolvedExecution,
-    explicit_effort: Option<&str>,
 ) -> anyhow::Result<ResolvedExecution> {
     let actual = initialized_swarm_execution(provider)?;
     if !same_swarm_execution(&actual, expected) {
@@ -514,11 +512,11 @@ pub(super) fn verify_swarm_execution(
             "Initialized swarm route differs from the admitted model/provider/API route; refusing fallback."
         );
     }
-    if explicit_effort.is_some_and(|effort| actual.effort.as_deref() != Some(effort.trim())) {
+    if actual.effort != expected.effort {
         anyhow::bail!(
-            "Initialized swarm effort {:?} does not match explicit effort {:?}.",
+            "Initialized swarm effort {:?} does not match pinned effort {:?}.",
             actual.effort,
-            explicit_effort
+            expected.effort
         );
     }
     Ok(actual)
@@ -527,7 +525,7 @@ pub(super) fn verify_swarm_execution(
 pub(super) fn initialize_swarm_provider(
     provider: &dyn Provider,
     target: &ResolvedExecution,
-    explicit_effort: Option<&str>,
+    enforce_effort: bool,
 ) -> anyhow::Result<ResolvedExecution> {
     let route = provider
         .model_routes()
@@ -537,9 +535,11 @@ pub(super) fn initialize_swarm_provider(
             anyhow::anyhow!("Admitted swarm route became unavailable before initialization.")
         })?;
     provider.set_route_selection(&RouteSelection::from_model_route(&route))?;
-    if let Some(effort) = target.effort.as_deref() {
+    if let Some(effort) = target.effort.as_deref()
+        && provider.reasoning_effort().as_deref() != Some(effort)
+    {
         if let Err(error) = provider.set_reasoning_effort(effort) {
-            if explicit_effort.is_some() {
+            if enforce_effort {
                 return Err(error);
             }
             crate::logging::warn(&format!(
@@ -547,7 +547,14 @@ pub(super) fn initialize_swarm_provider(
             ));
         }
     }
-    verify_swarm_execution(provider, target, explicit_effort)
+    // Only first admission with omitted caller effort may tolerate a configured
+    // default the provider cannot apply. Pin the observed effort, including None,
+    // so subsequent initialization never reinterprets it using new defaults.
+    let mut effective = target.clone();
+    if !enforce_effort {
+        effective.effort = provider.reasoning_effort();
+    }
+    verify_swarm_execution(provider, &effective)
 }
 
 fn selector_matches_route(selector: &str, route: &ModelRoute) -> bool {
@@ -841,7 +848,7 @@ pub(super) async fn admit_swarm_execution(
     let coordinator = resolve_coordinator_spawn_identity(session_id, sessions).await;
     let effort =
         resolve_swarm_spawn_effort(requested_effort.as_deref(), config.swarm_effort.as_deref());
-    let resolved = if let Some(pinned) = pinned {
+    let mut resolved = if let Some(pinned) = pinned {
         let route = routes
             .iter()
             .find(|r| r.available && same_swarm_execution(&execution_for_route(r, None), pinned))
@@ -889,9 +896,13 @@ pub(super) async fn admit_swarm_execution(
             })
             .map(|r| execution_for_route(r, effort))
     };
-    if let Some(target) = resolved.as_ref() {
+    if let Some(target) = resolved.as_mut() {
         let probe = provider.fork();
-        initialize_swarm_provider(probe.as_ref(), target, requested_effort.as_deref())?;
+        *target = initialize_swarm_provider(
+            probe.as_ref(),
+            target,
+            pinned.is_some() || requested_effort.is_some(),
+        )?;
     }
     Ok(SwarmRoutingStatus {
         requested_model,
@@ -960,11 +971,7 @@ pub(super) async fn verify_swarm_session_startup(
         routing.selection_enabled = Some(config.swarm_model_selection);
     }
     routing.actual_execution = match routing.resolved_execution.as_ref() {
-        Some(target) => Some(verify_swarm_execution(
-            provider.as_ref(),
-            target,
-            routing.requested_effort.as_deref(),
-        )?),
+        Some(target) => Some(verify_swarm_execution(provider.as_ref(), target)?),
         None => {
             if routing
                 .requested_effort
@@ -1078,7 +1085,7 @@ async fn register_visible_spawned_member(
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
 ) {
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let now = Instant::now();
+    let now = std::time::Instant::now();
     let friendly_name = crate::id::extract_session_name(session_id)
         .map(|name| name.to_string())
         .unwrap_or_else(|| session_id.to_string());
@@ -1201,11 +1208,7 @@ pub(super) async fn spawn_swarm_agent(
     let initialized_provider = provider_template.fork();
     if let Some(target) = routing.resolved_execution.as_ref() {
         // Provider/auth failures occur outside the terminal-launch fallback.
-        initialize_swarm_provider(
-            initialized_provider.as_ref(),
-            target,
-            requested_effort.as_deref(),
-        )?;
+        initialize_swarm_provider(initialized_provider.as_ref(), target, true)?;
     } else if let Some(effort) = requested_effort.as_deref() {
         initialized_provider.set_reasoning_effort(effort.trim())?;
         if initialized_provider.reasoning_effort().as_deref() != Some(effort.trim()) {
@@ -1242,16 +1245,13 @@ pub(super) async fn spawn_swarm_agent(
     let spawn_model = selection.model.clone();
     let spawn_provider_key = selection.provider_key.clone();
     let spawn_route_api_method = selection.route_api_method.clone();
-    let spawn_effort = routing
-        .resolved_execution
-        .as_ref()
-        .and_then(|r| r.effort.clone())
-        .or_else(|| {
-            resolve_swarm_spawn_effort(
-                requested_effort.as_deref(),
-                agents_config.swarm_effort.as_deref(),
-            )
-        });
+    let spawn_effort = match routing.resolved_execution.as_ref() {
+        Some(target) => target.effort.clone(),
+        None => resolve_swarm_spawn_effort(
+            requested_effort.as_deref(),
+            agents_config.swarm_effort.as_deref(),
+        ),
+    };
     crate::logging::info(&format!(
         "Swarm spawn model resolution: requested_model={:?} requested_effort={:?} configured_swarm_effort={:?} configured_swarm_model={:?} coordinator_model={:?} coordinator_provider_key={:?} coordinator_route={:?} -> spawn_model={:?} spawn_provider_key={:?} spawn_route={:?}",
         requested_model,
