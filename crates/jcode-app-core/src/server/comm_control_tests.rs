@@ -163,7 +163,10 @@ include!("comm_control_tests/await_resume_expired.rs");
 include!("comm_control_tests/await_background_expired.rs");
 include!("comm_control_tests/await_upgrade_background.rs");
 include!("comm_control_tests/dag_e2e.rs");
+include!("comm_control_tests/dag_assignment_contract.rs");
 include!("comm_control_tests/auto_worker_filter.rs");
 include!("comm_control_tests/client_attached_dispatch.rs");
 
 include!("comm_control_tests/routing.rs");
+include!("comm_control_tests/routing_races.rs");
+include!("comm_control_tests/execution_errors.rs");

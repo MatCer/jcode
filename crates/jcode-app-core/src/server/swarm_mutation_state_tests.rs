@@ -123,6 +123,52 @@ async fn swarm_mutation_concurrent_duplicates_share_final_done_response() {
     }
 }
 
+#[tokio::test]
+async fn swarm_mutation_disconnected_waiter_preserves_live_delivery_and_disk_replay() {
+    let (_env, _runtime_dir) = RuntimeEnvGuard::new();
+    let runtime = SwarmMutationRuntime::default();
+    let key = "disconnected-assignment-waiter";
+    let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = begin_or_replay(&runtime, key, "assign_task", "coord", 1, &closed_tx)
+        .await
+        .unwrap();
+    assert!(
+        begin_or_replay(&runtime, key, "assign_task", "coord", 2, &live_tx)
+            .await
+            .is_none()
+    );
+    drop(closed_rx);
+
+    finish_request(&runtime, &state, PersistedSwarmMutationResponse::Done).await;
+    assert!(matches!(
+        live_rx.try_recv().unwrap(),
+        ServerEvent::Done { id: 2 }
+    ));
+    let sync = runtime.sync.read().await;
+    assert!(!sync.active_keys.contains(key));
+    assert!(!sync.waiters.contains_key(key));
+    drop(sync);
+
+    let restarted = SwarmMutationRuntime::default();
+    // Even a disconnected replay request must not claim fresh execution.
+    assert!(
+        begin_or_replay(&restarted, key, "assign_task", "coord", 3, &closed_tx)
+            .await
+            .is_none()
+    );
+    assert!(
+        begin_or_replay(&restarted, key, "assign_task", "coord", 4, &live_tx)
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        live_rx.try_recv().unwrap(),
+        ServerEvent::Done { id: 4 }
+    ));
+    assert!(restarted.sync.read().await.active_keys.is_empty());
+}
+
 /// Regression: a control-driven mutation (retry/reassign/replace/salvage)
 /// must re-dispatch even when an identical mutation persisted a success
 /// within the final-state TTL. Replaying the stale success would turn the
@@ -289,9 +335,16 @@ async fn routing_assignment_replay_keeps_pin_without_stale_actual() {
     let (_env, _dir) = RuntimeEnvGuard::new();
     let runtime = SwarmMutationRuntime::default();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let state = begin_or_replay(&runtime, "assignment-actual-replay", "assign_task", "coord", 1, &tx)
-        .await
-        .unwrap();
+    let state = begin_or_replay(
+        &runtime,
+        "assignment-actual-replay",
+        "assign_task",
+        "coord",
+        1,
+        &tx,
+    )
+    .await
+    .unwrap();
     let target = jcode_plan::ResolvedExecution {
         model: "gpt-5.5".into(),
         provider_key: "openai-oauth".into(),
@@ -335,6 +388,11 @@ async fn routing_assignment_replay_keeps_pin_without_stale_actual() {
 
 #[test]
 fn routing_old_assignment_response_deserializes_without_routing() {
-    let response: PersistedSwarmMutationResponse = serde_json::from_str(r#"{"AssignTask":{"task_id":"task","target_session":"worker"}}"#).unwrap();
-    assert!(matches!(response, PersistedSwarmMutationResponse::AssignTask { routing: None, .. }));
+    let response: PersistedSwarmMutationResponse =
+        serde_json::from_str(r#"{"AssignTask":{"task_id":"task","target_session":"worker"}}"#)
+            .unwrap();
+    assert!(matches!(
+        response,
+        PersistedSwarmMutationResponse::AssignTask { routing: None, .. }
+    ));
 }

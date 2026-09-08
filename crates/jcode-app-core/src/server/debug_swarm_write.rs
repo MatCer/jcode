@@ -620,12 +620,19 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
         .await
         .get(&swarm_id)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_else(VersionedPlan::new);
     let mut staged_plan = admitted_plan.clone();
-    let node_id = if parsed.op == "inject" {
-        parsed.gate_id.as_deref()
-    } else {
-        parsed.node_id.as_deref()
+    let node_id = match parsed.op.as_str() {
+        "seed" => None,
+        "expand" | "complete" => match parsed.node_id.as_deref() {
+            Some(node_id) if !node_id.trim().is_empty() => Some(node_id),
+            _ => return fail("node_id required and must not be blank"),
+        },
+        "inject" => match parsed.gate_id.as_deref() {
+            Some(gate_id) if !gate_id.trim().is_empty() => Some(gate_id),
+            _ => return fail("gate_id required and must not be blank"),
+        },
+        other => return fail(format!("unknown op '{other}'")),
     };
     let mut actor_routing = if parsed.op != "seed" {
         let Some(node_id) = node_id else {
@@ -661,17 +668,19 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     } else {
         parsed.nodes
     });
+    // Legacy nodes have no routing metadata. Borrow that default rather than
+    // cloning metadata just to pass it through read-only routing admission.
+    let legacy_meta = jcode_plan::NodeMeta::default();
     let parent = node_id
         .and_then(|id| admitted_plan.node_meta.get(id))
-        .cloned()
-        .unwrap_or_default();
+        .unwrap_or(&legacy_meta);
     let generates_gate = matches!(parsed.op.as_str(), "seed" | "expand")
         && staged_plan.mode.eq_ignore_ascii_case("deep");
     let allowed = if parsed.op != "complete" {
         match super::comm_graph::validate_graph_specs(
             &actor,
             &specs,
-            &parent,
+            parent,
             generates_gate,
             ctx.sessions,
             ctx.swarm_members,
@@ -695,19 +704,24 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     if let Some(node_id) = node_id {
         super::comm_graph::claim_queued_node_for_actor(&mut graph, node_id, &actor);
     }
-    let result = match parsed.op.as_str() {
-        "seed" => dag::seed(&mut graph, specs),
-        "expand" => dag::expand_node(&mut graph, node_id.unwrap(), &actor, specs).map(|_| ()),
-        "inject" => dag::inject_from_gate(&mut graph, node_id.unwrap(), &actor, specs).map(|_| ()),
-        "complete" => {
+    let result = match (parsed.op.as_str(), node_id) {
+        ("seed", _) => dag::seed(&mut graph, specs),
+        ("expand", Some(node_id)) => {
+            dag::expand_node(&mut graph, node_id, &actor, specs).map(|_| ())
+        }
+        ("inject", Some(gate_id)) => {
+            dag::inject_from_gate(&mut graph, gate_id, &actor, specs).map(|_| ())
+        }
+        ("complete", Some(node_id)) => {
             let artifact =
                 match serde_json::from_value(parsed.artifact.unwrap_or(serde_json::json!({}))) {
                     Ok(artifact) => artifact,
                     Err(error) => return fail(format!("invalid artifact: {error}")),
                 };
-            dag::complete_node(&mut graph, node_id.unwrap(), &actor, artifact)
+            dag::complete_node(&mut graph, node_id, &actor, artifact)
         }
-        other => return fail(format!("unknown op '{other}'")),
+        ("expand" | "inject" | "complete", None) => return fail("node_id/gate_id required"),
+        (other, _) => return fail(format!("unknown op '{other}'")),
     };
     let result: Result<(usize, &str), String> = match result {
         Err(error) => Err(error.to_string()),

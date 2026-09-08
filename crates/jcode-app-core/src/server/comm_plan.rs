@@ -165,11 +165,13 @@ pub(super) async fn handle_comm_propose_plan(
         {
             Ok(metadata) => metadata,
             Err(error) => {
-                let _ = client_event_tx.send(ServerEvent::Error {
+                if let Err(error) = client_event_tx.send(ServerEvent::Error {
                     id,
                     message: format!("Plan routing rejected: {error}"),
                     retry_after_secs: None,
-                });
+                }) {
+                    crate::logging::debug(&format!("Could not deliver swarm plan event: {error}"));
+                }
                 return;
             }
         };
@@ -179,11 +181,13 @@ pub(super) async fn handle_comm_propose_plan(
                 .entry(swarm_id.clone())
                 .or_insert_with(VersionedPlan::new);
             if plan.version != admitted_plan.version {
-                let _ = client_event_tx.send(ServerEvent::Error {
+                if let Err(error) = client_event_tx.send(ServerEvent::Error {
                     id,
                     message: "Plan changed during admission; retry update.".into(),
                     retry_after_secs: None,
-                });
+                }) {
+                    crate::logging::debug(&format!("Could not deliver swarm plan event: {error}"));
+                }
                 return;
             }
             plan.node_meta.extend(metadata);
@@ -262,7 +266,9 @@ pub(super) async fn handle_comm_propose_plan(
         )
         .await;
 
-        let _ = client_event_tx.send(ServerEvent::Done { id });
+        if let Err(error) = client_event_tx.send(ServerEvent::Done { id }) {
+            crate::logging::debug(&format!("Could not deliver swarm plan event: {error}"));
+        }
         return;
     }
 
@@ -376,7 +382,9 @@ pub(super) async fn handle_comm_propose_plan(
     )
     .await;
 
-    let _ = client_event_tx.send(ServerEvent::Done { id });
+    if let Err(error) = client_event_tx.send(ServerEvent::Done { id }) {
+        crate::logging::debug(&format!("Could not deliver swarm plan event: {error}"));
+    }
 }
 
 #[expect(

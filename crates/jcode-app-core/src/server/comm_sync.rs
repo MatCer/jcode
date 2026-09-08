@@ -301,10 +301,17 @@ pub(super) async fn handle_comm_status(
                     {
                         let mut routing = member.runtime.routing.clone().unwrap_or_default();
                         routing.actual_execution =
-                            super::comm_session::initialized_swarm_execution(
+                            match super::comm_session::initialized_swarm_execution(
                                 agent.provider_fork().as_ref(),
-                            )
-                            .ok();
+                            ) {
+                                Ok(actual) => Some(actual),
+                                Err(error) => {
+                                    crate::logging::debug(&format!(
+                                        "Cannot observe swarm status execution for '{target_session}': {error}"
+                                    ));
+                                    None
+                                }
+                            };
                         (
                             Some(agent.provider_name()),
                             Some(agent.provider_model()),
@@ -347,7 +354,9 @@ pub(super) async fn handle_comm_status(
         }
     };
 
-    let _ = client_event_tx.send(ServerEvent::CommStatusResponse { id, snapshot });
+    if let Err(error) = client_event_tx.send(ServerEvent::CommStatusResponse { id, snapshot }) {
+        crate::logging::debug(&format!("Could not deliver swarm status response: {error}"));
+    }
 }
 
 pub(super) async fn handle_comm_read_context(
@@ -462,16 +471,22 @@ pub(super) async fn handle_comm_plan_status(
         };
         // A durable pin and an old startup observation are not current actual
         // execution. Busy agents have no fresh observation available.
-        routing.actual_execution =
-            agents
-                .get(&session_id)
-                .and_then(|agent| match agent.try_lock() {
-                    Ok(agent) => super::comm_session::initialized_swarm_execution(
-                        agent.provider_fork().as_ref(),
-                    )
-                    .ok(),
-                    Err(_) => None,
-                });
+        routing.actual_execution = agents.get(&session_id).and_then(|agent| {
+            match agent.try_lock() {
+                Ok(agent) => match super::comm_session::initialized_swarm_execution(
+                    agent.provider_fork().as_ref(),
+                ) {
+                    Ok(actual) => Some(actual),
+                    Err(error) => {
+                        crate::logging::debug(&format!(
+                            "Cannot observe node '{node_id}' execution for '{session_id}': {error}"
+                        ));
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        });
     }
     let _ = client_event_tx.send(ServerEvent::CommPlanStatusResponse { id, summary });
 }

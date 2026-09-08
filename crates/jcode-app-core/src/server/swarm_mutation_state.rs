@@ -142,12 +142,16 @@ pub(super) fn save_state(state: &PersistedSwarmMutationState) {
 }
 
 fn clear_persisted_actual_execution(state: &mut PersistedSwarmMutationState) {
-    if let Some(PersistedSwarmMutationResponse::Spawn {
-        routing: Some(routing),
-        ..
-    } | PersistedSwarmMutationResponse::AssignTask {
-        routing: Some(routing), ..
-    }) = state.final_response.as_mut()
+    if let Some(
+        PersistedSwarmMutationResponse::Spawn {
+            routing: Some(routing),
+            ..
+        }
+        | PersistedSwarmMutationResponse::AssignTask {
+            routing: Some(routing),
+            ..
+        },
+    ) = state.final_response.as_mut()
     {
         // A disk replay knows the pinned target, not a currently initialized
         // worker. The original in-memory response retains its verified actual.
@@ -282,8 +286,13 @@ async fn begin_with_mode(
                 .as_deref()
                 .is_some_and(|previous| previous != request)
             {
-                let _ = client_event_tx.send(ServerEvent::Error { id: request_id,
-                    message: "The spawn request nonce was already used with conflicting routing (model, effort or allowed_models). Use a new nonce for a new worker.".into(), retry_after_secs: None });
+                if let Err(error) = client_event_tx.send(ServerEvent::Error {
+                    id: request_id,
+                    message: "The spawn request nonce was already used with conflicting routing (model, effort or allowed_models). Use a new nonce for a new worker.".into(),
+                    retry_after_secs: None,
+                }) {
+                    crate::logging::debug(&format!("Could not deliver swarm mutation event: {error}"));
+                }
                 return None;
             }
             state.routing_request = Some(request.to_string());
@@ -292,7 +301,11 @@ async fn begin_with_mode(
         if replay_final
             && let Some(final_response) = load_state(key).and_then(|state| state.final_response)
         {
-            let _ = client_event_tx.send(final_response.into_server_event(request_id, session_id));
+            if let Err(error) =
+                client_event_tx.send(final_response.into_server_event(request_id, session_id))
+            {
+                crate::logging::debug(&format!("Could not deliver swarm mutation event: {error}"));
+            }
             return None;
         }
         sync.waiters
@@ -342,11 +355,13 @@ pub(super) async fn finish_request(
         waiters
     };
     for waiter in waiters {
-        let _ = waiter.client_event_tx.send(
+        if let Err(error) = waiter.client_event_tx.send(
             response
                 .clone()
                 .into_server_event(waiter.request_id, &persisted.session_id),
-        );
+        ) {
+            crate::logging::debug(&format!("Could not deliver swarm mutation event: {error}"));
+        }
     }
 }
 

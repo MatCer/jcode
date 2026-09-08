@@ -115,9 +115,12 @@ pub(super) async fn validate_graph_actor(
     let root = ancestry
         .last()
         .ok_or_else(|| anyhow::anyhow!("Missing trusted root"))?;
-    let meta = plan.node_meta.get(node_id).cloned().unwrap_or_default();
+    // Legacy nodes inherit routing without metadata. Admission is read-only,
+    // so borrow either the stored metadata or the same unrestricted default.
+    let legacy_meta = jcode_plan::NodeMeta::default();
+    let meta = plan.node_meta.get(node_id).unwrap_or(&legacy_meta);
     let mut routing = super::comm_control::admit_node_execution(
-        root, &meta, None, None, None, sessions, members, provider,
+        root, meta, None, None, None, sessions, members, provider,
     )
     .await?;
     let actor_allowed = super::comm_session::effective_swarm_allowed_models(
@@ -352,16 +355,22 @@ pub(super) fn claim_queued_node_for_actor(graph: &mut TaskGraph, node_id: &str, 
         // `dispatch` re-validates queued status and dependency satisfaction; if
         // deps are not done the claim is skipped and the engine op reports the
         // real error.
-        let _ = dag::dispatch(graph, node_id, actor);
+        if !dag::dispatch(graph, node_id, actor) {
+            crate::logging::debug(&format!(
+                "Graph node '{node_id}' cannot be claimed by '{actor}' until dependencies complete"
+            ));
+        }
     }
 }
 
 fn err(client_event_tx: &mpsc::UnboundedSender<ServerEvent>, id: u64, message: String) {
-    let _ = client_event_tx.send(ServerEvent::Error {
+    if let Err(error) = client_event_tx.send(ServerEvent::Error {
         id,
         message,
         retry_after_secs: None,
-    });
+    }) {
+        crate::logging::debug(&format!("Could not deliver swarm graph event: {error}"));
+    }
 }
 
 /// Shared finalize: persist, broadcast, record a plan-update event, and ack.
@@ -418,7 +427,9 @@ async fn finalize(
         },
     )
     .await;
-    let _ = client_event_tx.send(ServerEvent::Done { id });
+    if let Err(error) = client_event_tx.send(ServerEvent::Done { id }) {
+        crate::logging::debug(&format!("Could not deliver swarm graph event: {error}"));
+    }
 }
 
 /// Seed (or re-seed) the swarm task DAG from a batch of node specs.
