@@ -727,7 +727,7 @@ async fn routing_legacy_approval_rejects_spoofed_shared_context_provenance() {
 #[tokio::test]
 async fn routing_legacy_direct_update_preserves_existing_node_pin() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
-    let fx = plan_fixture("routing-legacy-pin", "coord-lp", "worker-lp");
+    let mut fx = plan_fixture("routing-legacy-pin", "coord-lp", "worker-lp");
     let meta = jcode_plan::NodeMeta {
         model: Some("gpt-6-astra".into()),
         effort: Some("medium".into()),
@@ -747,9 +747,16 @@ async fn routing_legacy_direct_update_preserves_existing_node_pin() {
         plan.items.push(plan_item("a", &[]));
         plan.node_meta.insert("a".into(), meta.clone());
     }
-    fx.propose(&fx.coord, vec![plan_item("a", &[])]).await;
-    assert_eq!(
-        fx.swarm_plans.read().await[&fx.swarm_id].node_meta["a"],
-        meta
-    );
+    let before_version = fx.swarm_plans.read().await[&fx.swarm_id].version;
+    let mut updated = plan_item("a", &[]);
+    updated.content = "updated task a, keeping its execution pin".into();
+    fx.propose(&fx.coord, vec![updated.clone()]).await;
+    let events = fx.drain_events();
+    assert!(saw_done(&events), "direct update must ack: {events:?}");
+    assert!(error_messages(&events).is_empty(), "{events:?}");
+    let plans = fx.swarm_plans.read().await;
+    let plan = &plans[&fx.swarm_id];
+    assert_eq!(plan.version, before_version + 1);
+    assert_eq!(plan.items, vec![updated]);
+    assert_eq!(plan.node_meta["a"], meta);
 }

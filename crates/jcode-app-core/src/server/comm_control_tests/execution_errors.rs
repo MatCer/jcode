@@ -1,12 +1,20 @@
 // Error-path checks exercise the same handler boundary as debug socket requests.
 async fn execution_debug_graph(fx: &GraphFixture, request: serde_json::Value) -> serde_json::Value {
+    execution_debug_graph_with_provider(fx, request, &(Arc::new(TestProvider) as Arc<dyn Provider>))
+        .await
+}
+
+async fn execution_debug_graph_with_provider(
+    fx: &GraphFixture,
+    request: serde_json::Value,
+    provider: &Arc<dyn Provider>,
+) -> serde_json::Value {
     let session_id = Arc::new(RwLock::new(fx.coord.clone()));
     let shared_context = Arc::new(RwLock::new(HashMap::new()));
-    let provider: Arc<dyn Provider> = Arc::new(TestProvider);
     let ctx = crate::server::debug_swarm_write::DebugSwarmWriteContext {
         session_id: &session_id,
         sessions: &fx.sessions,
-        provider_template: &provider,
+        provider_template: provider,
         swarm_members: &fx.swarm_members,
         swarms_by_id: &fx.swarms_by_id,
         shared_context: &shared_context,
@@ -21,6 +29,105 @@ async fn execution_debug_graph(fx: &GraphFixture, request: serde_json::Value) ->
     .unwrap()
     .expect("graph command handled");
     serde_json::from_str(&response).unwrap()
+}
+
+#[tokio::test]
+async fn execution_debug_seed_surplus_node_id_does_not_claim_or_inherit_parent() {
+    let env = RoutingConfigGuard::new();
+    env.configure(true, Some(&["gpt-6-astra"]));
+    for surplus in [None, Some("parent"), Some("unknown-parent")] {
+        let (fx, provider) = routing_fixture("debug-seed-parent-scope").await;
+        routing_seed(&fx, &provider, vec![routed_spec("parent", "gpt-6-astra")]).await;
+        {
+            let mut plans = fx.swarm_plans.write().await;
+            let meta = plans
+                .get_mut(&fx.swarm_id)
+                .unwrap()
+                .node_meta
+                .get_mut("parent")
+                .unwrap();
+            meta.allowed_models = Some(vec![]);
+            meta.resolved_execution = Some(routing_execution("gpt-6-astra", Some("medium")));
+        }
+        let before = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+        let mut request = serde_json::json!({
+            "op": "seed", "swarm_id": fx.swarm_id, "mode": "light",
+            "nodes": [{"id": "new-root", "content": "independent root task", "model": "gpt-6-astra"}]
+        });
+        if let Some(surplus) = surplus {
+            request["node_id"] = serde_json::json!(surplus);
+        }
+        let response = execution_debug_graph_with_provider(&fx, request, &provider).await;
+        assert_eq!(response["ok"], true, "{surplus:?}: {response}");
+        assert_eq!(response["op"], "seed");
+        assert_eq!(response["count"], 1);
+        let after = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+        assert_eq!(after.version, before.version + 1);
+        let graph = jcode_plan::bridge::to_task_graph(&after);
+        assert_eq!(graph.len(), 2);
+        assert_eq!(
+            graph.get("parent"),
+            jcode_plan::bridge::to_task_graph(&before).get("parent")
+        );
+        assert_eq!(after.node_meta["parent"], before.node_meta["parent"]);
+        let seeded = graph.get("new-root").unwrap();
+        assert_eq!(seeded.content, "independent root task");
+        assert!(seeded.parent.is_none());
+        assert!(seeded.owner.is_none());
+        assert!(seeded.resolved_execution.is_none());
+        assert_eq!(
+            seeded.allowed_models,
+            Some(vec!["openai-oauth:gpt-6-astra".into()])
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_debug_seed_surplus_node_id_cannot_bypass_admission_guards() {
+    let env = RoutingConfigGuard::new();
+    let (fx, provider) = routing_fixture("debug-seed-guards").await;
+    routing_seed(&fx, &provider, vec![routed_spec("parent", "gpt-6-astra")]).await;
+    let before = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+    for (actor, enabled, allowed, expected_error) in [
+        ("outsider", true, None, "Actor must be an existing member"),
+        (
+            fx.worker.as_str(),
+            true,
+            None,
+            "Recursive swarm spawning is disabled",
+        ),
+        (
+            fx.coord.as_str(),
+            false,
+            None,
+            "Explicit swarm model selection is disabled",
+        ),
+        (fx.coord.as_str(), true, Some(&[][..]), "prohibited"),
+    ] {
+        env.configure(enabled, allowed);
+        for surplus in [None, Some("parent"), Some("unknown-parent")] {
+            let mut request = serde_json::json!({
+                "op": "seed", "swarm_id": fx.swarm_id, "actor": actor,
+                "nodes": [{"id": "blocked", "content": "must not be seeded", "model": "gpt-6-astra"}]
+            });
+            if let Some(surplus) = surplus {
+                request["node_id"] = serde_json::json!(surplus);
+            }
+            let response = execution_debug_graph_with_provider(&fx, request, &provider).await;
+            assert_eq!(response["ok"], false, "{surplus:?}: {response}");
+            assert!(
+                response["error"].as_str().unwrap().contains(expected_error),
+                "{response}"
+            );
+            let after = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+            assert_eq!(after.items, before.items);
+            assert_eq!(after.version, before.version);
+            assert_eq!(after.node_meta, before.node_meta);
+            assert_eq!(after.participants, before.participants);
+            assert_eq!(after.task_progress, before.task_progress);
+            assert_eq!(after.mode, before.mode);
+        }
+    }
 }
 
 #[tokio::test]
@@ -109,5 +216,10 @@ async fn execution_unverifiable_concrete_worker_preserves_observation_error() {
             .to_string()
             .contains("Cannot verify worker 'opaque-worker' initialized execution"),
         "{error:#}"
+    );
+    assert!(
+        error.chain().skip(1).any(|cause| cause.to_string()
+            == "Initialized provider identity cannot be verified against its catalog."),
+        "original provider observation error must survive the context: {error:#}"
     );
 }

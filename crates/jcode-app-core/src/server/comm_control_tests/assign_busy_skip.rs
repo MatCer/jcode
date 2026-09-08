@@ -106,6 +106,81 @@ fn released_claim_makes_member_pickable_again() {
 /// instead of stacking a second task onto it.
 #[tokio::test]
 async fn assign_task_does_not_stack_on_busy_worker() {
+    let _env = RoutingConfigGuard::new();
+    let (mut fx, provider) = routing_fixture("swarm-initialized-no-stack").await;
+    routing_seed(
+        &fx,
+        &provider,
+        vec![
+            routed_spec("in-flight", "gpt-6-astra"),
+            routed_spec("next", "gpt-6-astra"),
+        ],
+    )
+    .await;
+    while let Ok(event) = fx.client_rx.try_recv() {
+        assert!(!matches!(event, ServerEvent::Error { .. }), "{event:?}");
+    }
+    let agent = fx.sessions.read().await[&fx.worker].clone();
+    let queue = agent.lock().await.soft_interrupt_queue();
+    routing_assign(&fx, &provider, "in-flight", None, None, None).await;
+    assert!(matches!(
+        fx.client_rx.try_recv(),
+        Ok(ServerEvent::CommAssignTaskResponse { task_id, target_session, .. })
+            if task_id == "in-flight" && target_session == fx.worker
+    ));
+    let first_dispatch = {
+        let pending = queue.lock().unwrap();
+        assert_eq!(pending.len(), 1, "first assignment must actually dispatch");
+        pending[0].content.clone()
+    };
+    let before = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+    assert_eq!(
+        before.items[0].assigned_to.as_deref(),
+        Some(fx.worker.as_str())
+    );
+    assert_eq!(before.items[0].status, "queued");
+    assert_eq!(
+        before.node_meta["in-flight"].resolved_execution,
+        Some(routing_execution("gpt-6-astra", Some("medium")))
+    );
+    // The visible worker can report ready while its queued assignment remains
+    // incomplete. Fresh compatible identity must not bypass the plan-load guard.
+    fx.swarm_members
+        .write()
+        .await
+        .get_mut(&fx.worker)
+        .unwrap()
+        .status = "ready".into();
+    routing_assign(&fx, &provider, "next", None, None, None).await;
+    let message = routing_drain_error(&mut fx);
+    assert!(
+        message.contains("routing blocked:") && message.contains("Skipped 1 worker(s)"),
+        "{message}"
+    );
+    let after = fx.swarm_plans.read().await[&fx.swarm_id].clone();
+    assert_eq!(after.items, before.items);
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.node_meta, before.node_meta);
+    assert_eq!(after.task_progress, before.task_progress);
+    let assigned: Vec<&str> = after
+        .items
+        .iter()
+        .filter(|item| item.assigned_to.as_deref() == Some(fx.worker.as_str()))
+        .map(|item| item.id.as_str())
+        .collect();
+    assert_eq!(assigned, vec!["in-flight"]);
+    let pending = queue.lock().unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "refused second assignment must not dispatch"
+    );
+    assert_eq!(pending[0].content, first_dispatch);
+}
+
+/// An uninitialized worker is rejected before the separate plan-load guard.
+#[tokio::test]
+async fn assign_task_rejects_worker_with_unknown_initialized_identity() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
     let swarm_id = "swarm-no-stack";
     let requester = "coord";
@@ -182,7 +257,7 @@ async fn assign_task_does_not_stack_on_busy_worker() {
             assert!(
                 message.contains("routing blocked:")
                     && message.contains("No compatible initialized worker"),
-                "expected busy-worker routing refusal, got: {message}"
+                "expected unknown-identity routing refusal, got: {message}"
             );
         }
         other => panic!("expected Error refusing to stack, got {other:?}"),
