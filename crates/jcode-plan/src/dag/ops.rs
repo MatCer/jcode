@@ -212,6 +212,7 @@ fn ensure_root_gate(graph: &mut TaskGraph) {
                 model: None,
                 effort: None,
                 resolved_execution: None,
+                allowed_models: None,
                 origin: Some(NodeOrigin::Gate),
             });
         }
@@ -340,6 +341,7 @@ pub fn expand_node(
             model: None,
             effort: None,
             resolved_execution: None,
+            allowed_models: None,
             origin: Some(NodeOrigin::Gate),
         };
         staged.push(gate);
@@ -694,6 +696,7 @@ fn spec_to_node(spec: NodeSpec, parent: Option<String>, origin: NodeOrigin) -> T
         model: spec.model,
         effort: spec.effort,
         resolved_execution: None,
+        allowed_models: None,
         output: None,
         origin: Some(origin),
     }

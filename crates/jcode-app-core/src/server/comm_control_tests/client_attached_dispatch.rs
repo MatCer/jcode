@@ -89,8 +89,11 @@ async fn assign_task_to_client_attached_session_skips_server_side_run() {
         Some(worker.to_string()),
         Some("solo".to_string()),
         None,
+        None,
+        None,
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -109,6 +112,7 @@ async fn assign_task_to_client_attached_session_skips_server_side_run() {
             id,
             task_id,
             target_session,
+            ..
         } => {
             assert_eq!(id, 91);
             assert_eq!(task_id, "solo");

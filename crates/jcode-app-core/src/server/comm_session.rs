@@ -575,7 +575,7 @@ fn selector_matches_route(selector: &str, route: &ModelRoute) -> bool {
     swarm_model_key(selector) == swarm_model_key(&route.model)
 }
 
-fn permitted_route(route: &ModelRoute, allowed: Option<&[String]>) -> bool {
+pub(super) fn permitted_route(route: &ModelRoute, allowed: Option<&[String]>) -> bool {
     allowed.is_none_or(|allowed| allowed.iter().any(|s| selector_matches_route(s, route)))
 }
 

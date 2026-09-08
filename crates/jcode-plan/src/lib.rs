@@ -145,6 +145,9 @@ pub struct NodeMeta {
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_execution: Option<ResolvedExecution>,
+    /// Trusted server snapshot of inherited node restrictions. Never accepted from wire specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
     /// Terminal-action kind: "explore" | "implement" | "verify" | "fix" |
     /// "synthesize" | "critique". Defaults to a plain task when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -23,13 +23,253 @@ use crate::plan::{
     next_unassigned_runnable_item_id, task_control_action_allows_status, task_control_status_error,
     task_control_target_item_id,
 };
-use crate::protocol::{NotificationType, PlanGraphStatus, ServerEvent};
+use crate::protocol::{NotificationType, PlanGraphStatus, ServerEvent, SwarmRoutingStatus};
 use jcode_agent_runtime::SoftInterruptSource;
+use jcode_plan::{NodeMeta, ResolvedExecution};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
+
+fn node_requested_effort(
+    meta: &NodeMeta,
+    requested: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let requested = requested.map(|value| value.trim().to_string());
+    if requested.as_deref() == Some("") {
+        anyhow::bail!("effort must not be blank; omit effort to use the node setting.");
+    }
+    if let (Some(node), Some(requested)) = (&meta.effort, &requested)
+        && node.trim() != requested
+    {
+        anyhow::bail!("Assignment effort conflicts with the node's authoritative effort.");
+    }
+    Ok(meta.effort.clone().or(requested))
+}
+
+fn execution_matches_node(
+    expected: &ResolvedExecution,
+    actual: &ResolvedExecution,
+    explicit_effort: Option<&str>,
+    pinned: bool,
+) -> bool {
+    super::comm_session::same_swarm_execution(expected, actual)
+        && explicit_effort.is_none_or(|effort| actual.effort.as_deref() == Some(effort.trim()))
+        && (!pinned || expected.effort == actual.effort)
+}
+
+fn node_routing_requirement(routing: &SwarmRoutingStatus) -> String {
+    match routing.resolved_execution.as_ref() {
+        Some(route) => format!(
+            "model={}, provider={}, API={}, effort={}",
+            route.model,
+            route.provider_key,
+            route.api_method,
+            route
+                .effort
+                .as_deref()
+                .or(routing.requested_effort.as_deref())
+                .unwrap_or("inherited")
+        ),
+        None => format!(
+            "legacy inherited route, effort={}",
+            routing.requested_effort.as_deref().unwrap_or("inherited")
+        ),
+    }
+}
+
+/// Intersect durable restrictions, rather than treating an old snapshot as a
+/// new request to broaden today's policy. Use the existing catalog predicate.
+pub(super) fn intersect_node_allowed_models(
+    current: Option<&[String]>,
+    snapshot: Option<&[String]>,
+    routes: &[crate::provider::ModelRoute],
+) -> Option<Vec<String>> {
+    use super::comm_session::permitted_route;
+    use jcode_provider_core::RouteSelection;
+    if current.is_none() && snapshot.is_none() {
+        return None;
+    }
+    let mut allowed: Vec<String> = routes
+        .iter()
+        .filter(|route| permitted_route(route, current) && permitted_route(route, snapshot))
+        .map(|route| RouteSelection::from_model_route(route).routed_model_spec())
+        .collect();
+    // A selector can project several API routes. Never widen a restriction
+    // through such a lossy projection.
+    allowed.retain(|selector| {
+        routes
+            .iter()
+            .filter(|route| permitted_route(route, Some(std::slice::from_ref(selector))))
+            .all(|route| permitted_route(route, current) && permitted_route(route, snapshot))
+    });
+    allowed.sort();
+    allowed.dedup();
+    Some(allowed)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "node admission shares the spawn policy and trusted runtime handles"
+)]
+pub(super) async fn admit_node_execution(
+    requester: &str,
+    meta: &NodeMeta,
+    model: Option<String>,
+    effort: Option<String>,
+    allowed_models: Option<&[String]>,
+    sessions: &SessionAgents,
+    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    provider: &Arc<dyn crate::provider::Provider>,
+) -> anyhow::Result<SwarmRoutingStatus> {
+    use super::comm_session::{
+        admit_swarm_execution, effective_swarm_allowed_models, same_swarm_execution,
+    };
+    let effort = node_requested_effort(meta, effort)?;
+    let config = &crate::config::config().agents;
+    let routes = provider.model_routes();
+    let current = effective_swarm_allowed_models(
+        &*members.read().await,
+        requester,
+        config
+            .swarm_model_selection
+            .then_some(config.swarm_allowed_models.as_deref())
+            .flatten(),
+        allowed_models,
+        &routes,
+    )?;
+    let allowed =
+        intersect_node_allowed_models(current.as_deref(), meta.allowed_models.as_deref(), &routes);
+    let mut routing = admit_swarm_execution(
+        requester,
+        meta.model.clone().or(model.clone()),
+        effort.clone(),
+        allowed.as_deref(),
+        meta.resolved_execution.as_ref(),
+        sessions,
+        members,
+        provider,
+    )
+    .await?;
+    if let Some(requested) = model
+        && (meta.model.is_some() || meta.resolved_execution.is_some())
+    {
+        let override_route = admit_swarm_execution(
+            requester,
+            Some(requested),
+            effort,
+            allowed.as_deref(),
+            None,
+            sessions,
+            members,
+            provider,
+        )
+        .await?;
+        if !routing
+            .resolved_execution
+            .as_ref()
+            .zip(override_route.resolved_execution.as_ref())
+            .is_some_and(|(node, requested)| same_swarm_execution(node, requested))
+        {
+            anyhow::bail!(
+                "Assignment model conflicts with the node's authoritative model/pinned route."
+            );
+        }
+    }
+    routing.allowed_models = allowed;
+    Ok(routing)
+}
+
+/// Observe the worker's initialized provider, not its requested model or label.
+/// Opaque legacy providers remain usable only for unconstrained legacy nodes.
+pub(super) async fn compatible_node_candidates(
+    routing: &SwarmRoutingStatus,
+    pinned: bool,
+    sessions: &SessionAgents,
+    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    provider: &Arc<dyn crate::provider::Provider>,
+) -> HashMap<String, Option<ResolvedExecution>> {
+    let agents = sessions.read().await.clone();
+    let member_snapshot = members.read().await.clone();
+    let mut compatible = HashMap::new();
+    for (session_id, agent) in agents {
+        let (actual, actual_effort) = match agent.try_lock() {
+            Ok(agent) => {
+                let actual_provider = agent.provider_fork();
+                (
+                    super::comm_session::initialized_swarm_execution(actual_provider.as_ref()).ok(),
+                    actual_provider.reasoning_effort(),
+                )
+            }
+            Err(_) => {
+                let actual = member_snapshot
+                    .get(&session_id)
+                    .and_then(|member| member.runtime.routing.as_ref())
+                    .and_then(|routing| routing.actual_execution.clone());
+                let effort = actual.as_ref().and_then(|actual| actual.effort.clone());
+                (actual, effort)
+            }
+        };
+        let matches = if let Some(expected) = routing.resolved_execution.as_ref() {
+            actual.as_ref().is_some_and(|actual| {
+                execution_matches_node(
+                    expected,
+                    actual,
+                    routing.requested_effort.as_deref(),
+                    pinned,
+                )
+            })
+        } else {
+            routing
+                .requested_effort
+                .as_deref()
+                .is_none_or(|effort| actual_effort.as_deref() == Some(effort.trim()))
+        };
+        if !matches {
+            continue;
+        }
+        // A worker from a narrower subtree cannot be reused to evade its own
+        // restrictions, even when the assigning coordinator is unrestricted.
+        let config = &crate::config::config().agents;
+        let allowed = super::comm_session::effective_swarm_allowed_models(
+            &member_snapshot,
+            &session_id,
+            config
+                .swarm_model_selection
+                .then_some(config.swarm_allowed_models.as_deref())
+                .flatten(),
+            None,
+            &provider.model_routes(),
+        );
+        let Ok(allowed) = allowed else { continue };
+        if allowed.as_ref().is_some_and(|allowed| {
+            !actual.as_ref().is_some_and(|actual| {
+                provider.model_routes().iter().any(|route| {
+                    let selection = jcode_provider_core::RouteSelection::from_model_route(route);
+                    route.available
+                        && selection.runtime_key.stable_id() == actual.provider_key
+                        && selection.api_method == actual.api_method
+                        && selection.model == actual.model
+                        && super::comm_session::permitted_route(route, Some(allowed))
+                })
+            })
+        }) {
+            continue;
+        }
+        compatible.insert(session_id, actual);
+    }
+    compatible
+}
+
+fn pin_node_execution(meta: &mut NodeMeta, routing: &SwarmRoutingStatus) {
+    meta.model = routing.requested_model.clone();
+    meta.effort = routing.requested_effort.clone();
+    meta.allowed_models = routing.allowed_models.clone();
+    if meta.resolved_execution.is_none() {
+        meta.resolved_execution = routing.actual_execution.clone();
+    }
+}
 
 /// Eligible auto-assignment targets for a swarm task.
 ///
@@ -503,6 +743,7 @@ async fn resolve_assignment_target_session(
     requested_target: Option<&str>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    compatible: Option<&HashMap<String, Option<ResolvedExecution>>>,
 ) -> Result<String, String> {
     let members = swarm_members.read().await;
 
@@ -519,6 +760,11 @@ async fn resolve_assignment_target_session(
                 target, swarm_id
             ));
         }
+        if compatible.is_some_and(|c| !c.contains_key(target)) {
+            return Err(format!(
+                "Worker '{target}' has no compatible initialized model/provider/API/effort for this node. Choose a matching idle worker or enable spawn_if_needed."
+            ));
+        }
         return Ok(target.to_string());
     }
 
@@ -531,6 +777,12 @@ async fn resolve_assignment_target_session(
     };
 
     let mut candidates = filter_swarm_agent_candidates(&members, req_session_id, swarm_id);
+
+    let unfiltered_count = candidates.len();
+    candidates.retain(|member| compatible.is_none_or(|c| c.contains_key(&member.session_id)));
+    if unfiltered_count > 0 && candidates.is_empty() {
+        return Err("No compatible initialized worker for this node's model/provider/API/effort. Enable spawn_if_needed or provide a matching worker.".into());
+    }
 
     candidates.sort_by(|left, right| {
         let left_load = assignment_counts
@@ -583,6 +835,7 @@ pub(super) async fn resolve_assignment_target_for_task_test_hook(
         requested_target,
         swarm_members,
         swarm_plans,
+        None,
     )
     .await
 }
@@ -637,18 +890,9 @@ async fn next_runnable_task_id_reclaiming_stranded(
         }
     };
 
-    let mut plans = swarm_plans.write().await;
-    let plan = plans.get_mut(swarm_id)?;
-    let stranded_id = crate::plan::next_stranded_runnable_item_id(plan, &assignee_is_dead)?;
-    if crate::plan::reclaim_stranded_assignment(plan, &stranded_id) {
-        crate::logging::info(&format!(
-            "swarm {}: reclaimed stranded task '{}' from dead assignee for re-dispatch",
-            swarm_id, stranded_id
-        ));
-        Some(stranded_id)
-    } else {
-        None
-    }
+    let plans = swarm_plans.read().await;
+    let plan = plans.get(swarm_id)?;
+    crate::plan::next_stranded_runnable_item_id(plan, &assignee_is_dead)
 }
 
 async fn resolve_assignment_target_for_task(
@@ -658,6 +902,7 @@ async fn resolve_assignment_target_for_task(
     requested_target: Option<&str>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    compatible: Option<&HashMap<String, Option<ResolvedExecution>>>,
 ) -> Result<String, String> {
     if requested_target.is_some() {
         return resolve_assignment_target_session(
@@ -666,6 +911,7 @@ async fn resolve_assignment_target_for_task(
             requested_target,
             swarm_members,
             swarm_plans,
+            compatible,
         )
         .await;
     }
@@ -690,7 +936,10 @@ async fn resolve_assignment_target_for_task(
                 let owner_eligible =
                     filter_swarm_agent_candidates(&members, req_session_id, swarm_id)
                         .iter()
-                        .any(|member| member.session_id == owner);
+                        .any(|member| {
+                            member.session_id == owner
+                                && compatible.is_none_or(|c| c.contains_key(&owner))
+                        });
                 // The planner affinity deliberately bypasses the busy check (the
                 // synthesis needs its decomposition context), but not the race
                 // claim: if another in-flight pick just took this member, fall
@@ -712,6 +961,12 @@ async fn resolve_assignment_target_for_task(
 
     let members = swarm_members.read().await;
     let mut candidates = filter_swarm_agent_candidates(&members, req_session_id, swarm_id);
+
+    let unfiltered_count = candidates.len();
+    candidates.retain(|member| compatible.is_none_or(|c| c.contains_key(&member.session_id)));
+    if unfiltered_count > 0 && candidates.is_empty() {
+        return Err("No compatible initialized worker for this node's model/provider/API/effort. Enable spawn_if_needed or provide a matching worker.".into());
+    }
 
     candidates.sort_by(|left, right| {
         let left_carry = affinities
@@ -1393,9 +1648,12 @@ pub(super) async fn handle_comm_assign_task(
     req_session_id: String,
     target_session: Option<String>,
     task_id: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
     message: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
+    provider_template: &Arc<dyn crate::provider::Provider>,
     soft_interrupt_queues: &super::SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
@@ -1412,10 +1670,14 @@ pub(super) async fn handle_comm_assign_task(
         req_session_id,
         target_session,
         task_id,
+        model,
+        effort,
         message,
         AssignDedupMode::ReplayFinal,
+        None,
         client_event_tx,
         sessions,
+        provider_template,
         soft_interrupt_queues,
         client_connections,
         swarm_members,
@@ -1439,10 +1701,14 @@ async fn handle_comm_assign_task_with_mode(
     req_session_id: String,
     target_session: Option<String>,
     task_id: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
     message: Option<String>,
     dedup_mode: AssignDedupMode,
+    allowed_models: Option<Vec<String>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
+    provider_template: &Arc<dyn crate::provider::Provider>,
     soft_interrupt_queues: &super::SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
@@ -1478,6 +1744,71 @@ async fn handle_comm_assign_task_with_mode(
         None => return,
     };
 
+    let (selected_id, admitted_meta) = {
+        let plans = swarm_plans.read().await;
+        let Some(plan) = plans.get(&swarm_id) else {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "No swarm plan exists for this swarm.".into(),
+                retry_after_secs: None,
+            });
+            return;
+        };
+        let Some(task_id) = requested_task_id
+            .clone()
+            .or_else(|| next_unassigned_runnable_item_id(plan))
+        else {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: "No runnable unassigned tasks are available in the swarm plan".into(),
+                retry_after_secs: None,
+            });
+            return;
+        };
+        if !plan.items.iter().any(|item| item.id == task_id) {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: format!("Task '{task_id}' not found in swarm plan"),
+                retry_after_secs: None,
+            });
+            return;
+        }
+        (
+            task_id.clone(),
+            plan.node_meta.get(&task_id).cloned().unwrap_or_default(),
+        )
+    };
+    let mut routing = match admit_node_execution(
+        &req_session_id,
+        &admitted_meta,
+        model.clone(),
+        effort.clone(),
+        allowed_models.as_deref(),
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(routing) => routing,
+        Err(error) => {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: format!("Task '{selected_id}' routing blocked: {error}"),
+                retry_after_secs: None,
+            });
+            return;
+        }
+    };
+    let compatible = compatible_node_candidates(
+        &routing,
+        admitted_meta.resolved_execution.is_some(),
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await;
+
     let mutation_key = swarm_mutation_request_key(
         &req_session_id,
         "assign_task",
@@ -1490,6 +1821,9 @@ async fn handle_comm_assign_task_with_mode(
                 .clone()
                 .unwrap_or_else(|| "__next_runnable__".to_string()),
             message.clone().unwrap_or_default(),
+            model.clone().unwrap_or_default(),
+            effort.clone().unwrap_or_default(),
+            serde_json::to_string(&allowed_models).unwrap_or_default(),
         ],
     );
     let mutation_state = match dedup_mode {
@@ -1520,12 +1854,14 @@ async fn handle_comm_assign_task_with_mode(
         return;
     };
 
-    let target_session = match resolve_assignment_target_session(
+    let target_session = match resolve_assignment_target_for_task(
         &req_session_id,
         &swarm_id,
+        &selected_id,
         requested_target_session.as_deref(),
         swarm_members,
         swarm_plans,
+        Some(&compatible),
     )
     .await
     {
@@ -1535,7 +1871,10 @@ async fn handle_comm_assign_task_with_mode(
                 swarm_mutation_runtime,
                 &mutation_state,
                 PersistedSwarmMutationResponse::Error {
-                    message,
+                    message: format!(
+                        "Task '{selected_id}' routing blocked: {message}. Required {}",
+                        node_routing_requirement(&routing)
+                    ),
                     retry_after_secs: None,
                 },
             )
@@ -1544,15 +1883,29 @@ async fn handle_comm_assign_task_with_mode(
         }
     };
 
+    routing.actual_execution = compatible.get(&target_session).cloned().flatten();
+    let member_statuses: HashMap<_, _> = swarm_members
+        .read()
+        .await
+        .iter()
+        .map(|(id, member)| (id.clone(), member.status.clone()))
+        .collect();
     let (selected_task_id, task_content, participant_ids, plan_item_count, blocked_reason) = {
         let now_ms = now_unix_ms();
         let mut plans = swarm_plans.write().await;
-        let plan = plans
-            .entry(swarm_id.clone())
-            .or_insert_with(VersionedPlan::new);
-        let selected_task_id = requested_task_id
-            .clone()
-            .or_else(|| next_unassigned_runnable_item_id(plan));
+        let mut staged_plan = plans.get(&swarm_id).cloned().unwrap_or_default();
+        let plan = &mut staged_plan;
+        let assignee_is_dead = |id: &str| {
+            member_statuses
+                .get(id)
+                .is_none_or(|status| matches!(status.as_str(), "failed" | "stopped" | "crashed"))
+        };
+        if crate::plan::next_stranded_runnable_item_id(plan, &assignee_is_dead).as_deref()
+            == Some(&selected_id)
+        {
+            crate::plan::reclaim_stranded_assignment(plan, &selected_id);
+        }
+        let selected_task_id = Some(selected_id.clone());
         // Double-assignment guard: a direct assign_task naming an item that is
         // already assigned and actively worked is a coordination bug (observed
         // live: run_plan dispatched a node, then an explicit assign_task
@@ -1580,11 +1933,20 @@ async fn handle_comm_assign_task_with_mode(
         } else {
             None
         };
-        let blocked_reason = conflict_reason.or_else(|| {
-            requested_task_id
-                .as_deref()
-                .and_then(|task_id| explicit_task_blocked_reason(plan, task_id))
-        });
+        let routing_changed = plan
+            .node_meta
+            .get(&selected_id)
+            .cloned()
+            .unwrap_or_default()
+            != admitted_meta;
+        let blocked_reason = routing_changed
+            .then(|| "Node metadata changed during admission; retry assignment.".to_string())
+            .or(conflict_reason)
+            .or_else(|| {
+                requested_task_id
+                    .as_deref()
+                    .and_then(|task_id| explicit_task_blocked_reason(plan, task_id))
+            });
         let found_idx = if blocked_reason.is_some() {
             None
         } else {
@@ -1616,10 +1978,18 @@ async fn handle_comm_assign_task_with_mode(
             let content =
                 deep_mode_assignment_content(plan, &item_id, is_composite_synthesis, &hydrated);
 
+            pin_node_execution(plan.node_meta.entry(item_id.clone()).or_default(), &routing);
+            routing.resolved_execution = plan.node_meta[&item_id].resolved_execution.clone();
+
             // Index resolved under this same plan lock, so it stays valid.
             let item = &mut plan.items[found_idx];
             item.assigned_to = Some(target_session.clone());
             item.status = "queued".to_string();
+            let prior_progress = plan
+                .task_progress
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
             plan.task_progress.insert(
                 item_id.clone(),
                 SwarmTaskProgress {
@@ -1629,19 +1999,23 @@ async fn handle_comm_assign_task_with_mode(
                         120,
                     )),
                     assigned_at_unix_ms: Some(now_ms),
+                    dead_assignee_reclaims: prior_progress.dead_assignee_reclaims,
+                    no_artifact_requeues: prior_progress.no_artifact_requeues,
                     ..SwarmTaskProgress::default()
                 },
             );
             plan.version += 1;
             plan.participants.insert(req_session_id.clone());
             plan.participants.insert(target_session.clone());
-            (
+            let result = (
                 Some(item_id.clone()),
                 Some(content),
                 plan.participants.clone(),
                 plan.items.len(),
                 None,
-            )
+            );
+            plans.insert(swarm_id.clone(), staged_plan);
+            result
         } else {
             (None, None, HashSet::new(), 0, blocked_reason)
         }
@@ -1690,6 +2064,17 @@ async fn handle_comm_assign_task_with_mode(
         return;
     };
 
+    {
+        let mut members = swarm_members.write().await;
+        if let Some(member) = members.get_mut(&target_session) {
+            member.allowed_models = intersect_node_allowed_models(
+                member.allowed_models.as_deref(),
+                routing.allowed_models.as_deref(),
+                &provider_template.model_routes(),
+            );
+            member.runtime.routing = Some(routing.clone());
+        }
+    }
     let swarm_state = SwarmState {
         members: Arc::clone(swarm_members),
         swarms_by_id: Arc::clone(swarms_by_id),
@@ -1837,6 +2222,7 @@ async fn handle_comm_assign_task_with_mode(
         PersistedSwarmMutationResponse::AssignTask {
             task_id: selected_task_id,
             target_session,
+            routing: Some(routing),
         },
     )
     .await;
@@ -1856,6 +2242,7 @@ pub(super) async fn handle_comm_assign_next(
     message: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    allowed_models: Option<Vec<String>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
     global_session_id: &Arc<RwLock<String>>,
@@ -1872,157 +2259,145 @@ pub(super) async fn handle_comm_assign_next(
     mcp_pool: &Arc<crate::mcp::SharedMcpPool>,
     swarm_mutation_runtime: &SwarmMutationRuntime,
 ) {
-    if target_session.is_none() {
-        let swarm_id = match require_plan_driver_swarm(
+    let Some(swarm_id) = require_plan_driver_swarm(
+        id,
+        &req_session_id,
+        "Only the coordinator can assign tasks.",
+        client_event_tx,
+        swarm_members,
+        swarm_plans,
+        swarm_coordinators,
+    )
+    .await
+    else {
+        return;
+    };
+    let Some(selected_task_id) =
+        next_runnable_task_id_reclaiming_stranded(&swarm_id, swarm_plans, swarm_members).await
+    else {
+        let _ = client_event_tx.send(ServerEvent::Error {
             id,
-            &req_session_id,
-            "Only the coordinator can assign tasks.",
-            client_event_tx,
-            swarm_members,
-            swarm_plans,
-            swarm_coordinators,
-        )
+            message: "No runnable unassigned tasks are available in the swarm plan".into(),
+            retry_after_secs: None,
+        });
+        return;
+    };
+    let meta = swarm_plans
+        .read()
         .await
-        {
-            Some(swarm_id) => swarm_id,
-            None => return,
-        };
-
-        let Some(selected_task_id) =
-            next_runnable_task_id_reclaiming_stranded(&swarm_id, swarm_plans, swarm_members).await
-        else {
+        .get(&swarm_id)
+        .and_then(|plan| plan.node_meta.get(&selected_task_id))
+        .cloned()
+        .unwrap_or_default();
+    let routing = match admit_node_execution(
+        &req_session_id,
+        &meta,
+        model.clone(),
+        effort.clone(),
+        allowed_models.as_deref(),
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(routing) => routing,
+        Err(error) => {
             let _ = client_event_tx.send(ServerEvent::Error {
                 id,
-                message: "No runnable unassigned tasks are available in the swarm plan".to_string(),
+                message: format!("Task '{selected_task_id}' routing blocked: {error}"),
                 retry_after_secs: None,
             });
             return;
-        };
-
-        let preferred_target = resolve_assignment_target_for_task(
+        }
+    };
+    let compatible = compatible_node_candidates(
+        &routing,
+        meta.resolved_execution.is_some(),
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await;
+    let explicit_target = target_session.is_some();
+    let preferred = resolve_assignment_target_for_task(
+        &req_session_id,
+        &swarm_id,
+        &selected_task_id,
+        target_session.as_deref(),
+        swarm_members,
+        swarm_plans,
+        Some(&compatible),
+    )
+    .await;
+    let target = if !explicit_target
+        && (prefer_spawn.unwrap_or(false)
+            || (spawn_if_needed.unwrap_or(false) && preferred.is_err()))
+    {
+        if let Ok(unused) = &preferred {
+            release_auto_assign_claim(&swarm_id, unused);
+        }
+        match super::comm_session::spawn_swarm_agent(
             &req_session_id,
             &swarm_id,
-            &selected_task_id,
+            working_dir,
             None,
+            None,
+            routing.requested_model.clone(),
+            routing.requested_effort.clone(),
+            routing.allowed_models.clone(),
+            routing.resolved_execution.clone(),
+            None,
+            sessions,
+            global_session_id,
+            provider_template,
             swarm_members,
+            swarms_by_id,
+            swarm_coordinators,
             swarm_plans,
+            event_history,
+            event_counter,
+            swarm_event_tx,
+            mcp_pool,
+            soft_interrupt_queues,
+            client_connections,
         )
-        .await;
-
-        if (prefer_spawn.unwrap_or(false) || spawn_if_needed.unwrap_or(false))
-            && (prefer_spawn.unwrap_or(false) || preferred_target.is_err())
+        .await
         {
-            // A prefer_spawn run can reach here with a successfully resolved
-            // (and therefore claimed) reuse target it will never use; free it
-            // for concurrent picks.
-            if let Ok(unused_target) = &preferred_target {
-                release_auto_assign_claim(&swarm_id, unused_target);
-            }
-            match super::comm_session::spawn_swarm_agent(
-                &req_session_id,
-                &swarm_id,
-                working_dir.clone(),
-                None,
-                None,
-                model.clone(),
-                effort.clone(),
-                None,
-                sessions,
-                global_session_id,
-                provider_template,
-                swarm_members,
-                swarms_by_id,
-                swarm_coordinators,
-                swarm_plans,
-                event_history,
-                event_counter,
-                swarm_event_tx,
-                mcp_pool,
-                soft_interrupt_queues,
-                client_connections,
-            )
-            .await
-            {
-                Ok(spawned_session) => {
-                    handle_comm_assign_task(
-                        id,
-                        req_session_id,
-                        Some(spawned_session),
-                        Some(selected_task_id),
-                        message,
-                        client_event_tx,
-                        sessions,
-                        soft_interrupt_queues,
-                        client_connections,
-                        swarm_members,
-                        swarms_by_id,
-                        swarm_plans,
-                        swarm_coordinators,
-                        event_history,
-                        event_counter,
-                        swarm_event_tx,
-                        swarm_mutation_runtime,
-                    )
-                    .await;
-                    return;
-                }
-                Err(error) => {
-                    let _ = client_event_tx.send(ServerEvent::Error {
-                        id,
-                        message: format!("Failed to spawn preferred worker: {error}"),
-                        retry_after_secs: None,
-                    });
-                    return;
-                }
-            }
-        }
-
-        match preferred_target {
-            Ok(target_session) => {
-                handle_comm_assign_task(
-                    id,
-                    req_session_id,
-                    Some(target_session.clone()),
-                    Some(selected_task_id),
-                    message,
-                    client_event_tx,
-                    sessions,
-                    soft_interrupt_queues,
-                    client_connections,
-                    swarm_members,
-                    swarms_by_id,
-                    swarm_plans,
-                    swarm_coordinators,
-                    event_history,
-                    event_counter,
-                    swarm_event_tx,
-                    swarm_mutation_runtime,
-                )
-                .await;
-                // The pick was claimed at resolve time; by now the assignment
-                // either landed in the plan (busy via assignment_loads) or was
-                // rejected, so the in-flight claim is spent either way.
-                release_auto_assign_claim(&swarm_id, &target_session);
-            }
-            Err(message) => {
+            Ok(target) => target,
+            Err(error) => {
                 let _ = client_event_tx.send(ServerEvent::Error {
                     id,
-                    message,
+                    message: format!("Failed to spawn compatible worker: {error}"),
                     retry_after_secs: None,
                 });
+                return;
             }
         }
-        return;
-    }
-
-    handle_comm_assign_task(
+    } else {
+        match preferred {
+            Ok(target) => target,
+            Err(message) => {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id, message: format!("Task '{selected_task_id}' routing blocked: {message}. Required {}. Enable spawn_if_needed or provide a compatible worker.", node_routing_requirement(&routing)), retry_after_secs: None,
+                });
+                return;
+            }
+        }
+    };
+    handle_comm_assign_task_with_mode(
         id,
         req_session_id,
-        target_session,
-        None,
+        Some(target.clone()),
+        Some(selected_task_id),
+        model,
+        effort,
         message,
+        AssignDedupMode::ReplayFinal,
+        routing.allowed_models,
         client_event_tx,
         sessions,
+        provider_template,
         soft_interrupt_queues,
         client_connections,
         swarm_members,
@@ -2035,6 +2410,7 @@ pub(super) async fn handle_comm_assign_next(
         swarm_mutation_runtime,
     )
     .await;
+    release_auto_assign_claim(&swarm_id, &target);
 }
 
 #[expect(
@@ -2050,6 +2426,7 @@ pub(super) async fn handle_comm_task_control(
     message: Option<String>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     sessions: &SessionAgents,
+    provider_template: &Arc<dyn crate::provider::Provider>,
     soft_interrupt_queues: &super::SessionInterruptQueues,
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
@@ -2180,6 +2557,48 @@ pub(super) async fn handle_comm_task_control(
                 return;
             }
 
+            let admitted_meta = swarm_plans
+                .read()
+                .await
+                .get(&swarm_id)
+                .and_then(|plan| plan.node_meta.get(&task_id))
+                .cloned()
+                .unwrap_or_default();
+            let mut routing = match admit_node_execution(
+                &req_session_id,
+                &admitted_meta,
+                None,
+                None,
+                None,
+                sessions,
+                swarm_members,
+                provider_template,
+            )
+            .await
+            {
+                Ok(routing) => routing,
+                Err(error) => {
+                    let _ = client_event_tx.send(ServerEvent::Error {
+                        id,
+                        message: format!("Task '{task_id}' routing blocked: {error}"),
+                        retry_after_secs: None,
+                    });
+                    return;
+                }
+            };
+            let compatible = compatible_node_candidates(
+                &routing,
+                admitted_meta.resolved_execution.is_some(),
+                sessions,
+                swarm_members,
+                provider_template,
+            )
+            .await;
+            if !compatible.contains_key(&assignee) {
+                let _ = client_event_tx.send(ServerEvent::Error { id, message: format!("Assigned session '{assignee}' is unavailable, busy, or has incompatible model/provider/API/effort. Retry when idle or replace with a matching worker."), retry_after_secs: None });
+                return;
+            }
+            routing.actual_execution = compatible.get(&assignee).cloned().flatten();
             let assignment_text =
                 build_control_assignment_text(action, &snapshot.content, message.as_deref());
             // Validate the assignee is actually available BEFORE mutating any
@@ -2220,6 +2639,27 @@ pub(super) async fn handle_comm_task_control(
             };
 
             if agent_is_idle {
+                {
+                    let mut plans = swarm_plans.write().await;
+                    let Some(plan) = plans.get_mut(&swarm_id) else {
+                        return;
+                    };
+                    if plan.node_meta.get(&task_id).cloned().unwrap_or_default() != admitted_meta {
+                        let _ = client_event_tx.send(ServerEvent::Error {
+                            id,
+                            message: "Node metadata changed during admission; retry control."
+                                .into(),
+                            retry_after_secs: None,
+                        });
+                        return;
+                    }
+                    pin_node_execution(
+                        plan.node_meta.entry(task_id.clone()).or_default(),
+                        &routing,
+                    );
+                    routing.resolved_execution =
+                        plan.node_meta[&task_id].resolved_execution.clone();
+                }
                 if snapshot.status != "queued"
                     && requeue_existing_assignment(
                         &swarm_id,
@@ -2271,6 +2711,7 @@ pub(super) async fn handle_comm_task_control(
                     target_session: Some(assignee.clone()),
                     status: "running".to_string(),
                     summary,
+                    routing: Some(routing.clone()),
                 });
                 return;
             }
@@ -2298,6 +2739,7 @@ pub(super) async fn handle_comm_task_control(
                     target_session: Some(assignee.clone()),
                     status: "queued".to_string(),
                     summary,
+                    routing: Some(routing.clone()),
                 });
             } else {
                 let _ = client_event_tx.send(ServerEvent::Error {
@@ -2336,10 +2778,14 @@ pub(super) async fn handle_comm_task_control(
                 req_session_id,
                 Some(assignee),
                 Some(task_id),
+                None,
+                None,
                 Some(retry_note),
                 AssignDedupMode::AlwaysDispatch,
+                None,
                 client_event_tx,
                 sessions,
+                provider_template,
                 soft_interrupt_queues,
                 client_connections,
                 swarm_members,
@@ -2463,10 +2909,14 @@ pub(super) async fn handle_comm_task_control(
                 req_session_id,
                 Some(new_target),
                 Some(task_id),
+                None,
+                None,
                 forwarded_message,
                 AssignDedupMode::AlwaysDispatch,
+                None,
                 client_event_tx,
                 sessions,
+                provider_template,
                 soft_interrupt_queues,
                 client_connections,
                 swarm_members,

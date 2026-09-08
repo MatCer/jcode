@@ -67,9 +67,12 @@ async fn assign_task_without_target_prefers_less_loaded_ready_agent() {
         requester.to_string(),
         None,
         None,
+        None,
+        None,
         Some("Pick the least-loaded worker".to_string()),
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -88,6 +91,7 @@ async fn assign_task_without_target_prefers_less_loaded_ready_agent() {
             id,
             task_id,
             target_session,
+            ..
         } => {
             assert_eq!(id, 100);
             assert_eq!(task_id, "next");

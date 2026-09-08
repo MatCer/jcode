@@ -116,6 +116,7 @@ pub fn to_task_graph(plan: &VersionedPlan) -> TaskGraph {
             model: meta.model,
             effort: meta.effort,
             resolved_execution: meta.resolved_execution,
+            allowed_models: meta.allowed_models,
         });
     }
     graph
@@ -157,6 +158,7 @@ pub fn apply_task_graph(plan: &mut VersionedPlan, graph: &TaskGraph) {
                 model: node.model.clone(),
                 effort: node.effort.clone(),
                 resolved_execution: node.resolved_execution.clone(),
+                allowed_models: node.allowed_models.clone(),
                 kind: Some(kind_str(node.kind).to_string()),
                 parent: node.parent.clone(),
                 expanded: node.expanded,
@@ -514,7 +516,7 @@ mod tests {
         });
         let metadata = serde_json::json!({
             "kind":"implement", "model":"openai-oauth:gpt-6-astra", "effort":"high",
-            "resolved_execution":execution
+            "resolved_execution":execution, "allowed_models":["gpt-6-astra"]
         });
         let mut plan = VersionedPlan::default();
         let mut graph = TaskGraph::new(Mode::Light);
@@ -535,11 +537,15 @@ mod tests {
         let serialized = serde_json::to_vec(&plan.node_meta).unwrap();
         plan.node_meta = serde_json::from_slice(&serialized).unwrap();
         let roundtrip = serde_json::to_value(&plan.node_meta["r"]).unwrap();
-        for field in ["model", "effort", "resolved_execution"] {
+        for field in ["model", "effort", "resolved_execution", "allowed_models"] {
             assert_eq!(roundtrip[field], metadata[field]);
         }
         assert_eq!(to_task_graph(&plan).get("r"), lifted.get("r"));
         let old: NodeMeta = serde_json::from_str("{}").unwrap();
         assert_eq!(old, NodeMeta::default());
+        for value in [serde_json::json!({}), serde_json::json!({"allowed_models":[]}), serde_json::json!({"allowed_models":["gpt-6-astra"]})] {
+            let meta: NodeMeta = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(meta).unwrap()["allowed_models"], value["allowed_models"]);
+        }
     }
 }

@@ -492,6 +492,8 @@ pub(super) async fn handle_debug_client(
                             cmd,
                             &DebugSwarmWriteContext {
                                 session_id: &session_id,
+                                sessions: &sessions,
+                                provider_template: &provider,
                                 swarm_members: &swarm_members,
                                 swarms_by_id: &swarms_by_id,
                                 shared_context: &shared_context,

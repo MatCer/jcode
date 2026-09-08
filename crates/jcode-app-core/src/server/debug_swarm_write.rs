@@ -9,6 +9,8 @@ use tokio::sync::RwLock;
 
 pub(super) struct DebugSwarmWriteContext<'a> {
     pub(super) session_id: &'a Arc<RwLock<String>>,
+    pub(super) sessions: &'a super::SessionAgents,
+    pub(super) provider_template: &'a Arc<dyn crate::provider::Provider>,
     pub(super) swarm_members: &'a Arc<RwLock<HashMap<String, SwarmMember>>>,
     pub(super) swarms_by_id: &'a Arc<RwLock<HashMap<String, HashSet<String>>>>,
     pub(super) shared_context: &'a Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
@@ -562,6 +564,10 @@ struct DebugNodeSpec {
     depends_on: Vec<String>,
     #[serde(default)]
     priority: u8,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 fn debug_specs(specs: Vec<DebugNodeSpec>) -> Vec<jcode_plan::dag::NodeSpec> {
@@ -573,6 +579,8 @@ fn debug_specs(specs: Vec<DebugNodeSpec>) -> Vec<jcode_plan::dag::NodeSpec> {
             kind: jcode_plan::bridge::parse_kind(s.kind.as_deref()),
             depends_on: s.depends_on,
             priority: s.priority,
+            model: s.model,
+            effort: s.effort,
         })
         .collect()
 }
@@ -591,104 +599,132 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     };
     let swarm_id = parsed.swarm_id.clone();
 
-    let result: Result<(usize, &'static str), String> = {
-        let mut plans = ctx.swarm_plans.write().await;
-        let plan = plans
-            .entry(swarm_id.clone())
-            .or_insert_with(VersionedPlan::new);
-        match parsed.op.as_str() {
-            "seed" => {
-                if let Some(mode) = parsed.mode {
-                    plan.mode = mode;
-                }
-                let count = parsed.nodes.len();
-                let mut graph = to_task_graph(plan);
-                let before = graph.clone();
-                match dag::seed(&mut graph, debug_specs(parsed.nodes)) {
-                    Ok(()) => {
-                        if graph != before {
-                            apply_task_graph(plan, &graph);
-                            plan.version += 1;
-                        }
-                        Ok((count, "seed"))
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
-            }
-            "expand" => {
-                let Some(actor) = parsed.actor.clone() else {
-                    return fail("'actor' required");
-                };
-                let Some(node_id) = parsed.node_id.clone() else {
-                    return fail("'node_id' required");
-                };
-                let count = parsed.children.len();
-                // Dispatch the node to the actor so engine ownership checks pass.
-                if let Some(item) = plan.items.iter_mut().find(|i| i.id == node_id) {
-                    item.assigned_to = Some(actor.clone());
-                    item.status = "running".to_string();
-                }
-                let mut graph = to_task_graph(plan);
-                match dag::expand_node(&mut graph, &node_id, &actor, debug_specs(parsed.children)) {
-                    Ok(_) => {
-                        apply_task_graph(plan, &graph);
-                        plan.version += 1;
-                        Ok((count, "expand"))
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
-            }
-            "complete" => {
-                let Some(actor) = parsed.actor.clone() else {
-                    return fail("'actor' required");
-                };
-                let Some(node_id) = parsed.node_id.clone() else {
-                    return fail("'node_id' required");
-                };
-                let artifact: dag::HandoffArtifact = match serde_json::from_value(
-                    parsed.artifact.clone().unwrap_or(serde_json::json!({})),
-                ) {
+    let actor = parsed.actor.unwrap_or_else(|| String::new());
+    let actor = if actor.is_empty() {
+        ctx.session_id.read().await.clone()
+    } else {
+        actor
+    };
+    if !ctx
+        .swarm_members
+        .read()
+        .await
+        .get(&actor)
+        .is_some_and(|member| member.swarm_id.as_deref() == Some(&swarm_id))
+    {
+        return fail("Actor must be an existing member of this swarm.");
+    }
+    let admitted_plan = ctx
+        .swarm_plans
+        .read()
+        .await
+        .get(&swarm_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut staged_plan = admitted_plan.clone();
+    let node_id = if parsed.op == "inject" {
+        parsed.gate_id.as_deref()
+    } else {
+        parsed.node_id.as_deref()
+    };
+    let actor_routing = if parsed.op != "seed" {
+        let Some(node_id) = node_id else {
+            return fail("node_id/gate_id required");
+        };
+        match super::comm_graph::validate_graph_actor(
+            &actor,
+            node_id,
+            &admitted_plan,
+            ctx.sessions,
+            ctx.swarm_members,
+            ctx.provider_template,
+        )
+        .await
+        {
+            Ok(routing) => routing,
+            Err(error) => return fail(error),
+        }
+    } else {
+        None
+    };
+    if let Some(mode) = parsed.mode {
+        if admitted_plan.mode.eq_ignore_ascii_case("deep")
+            && !mode.eq_ignore_ascii_case("deep")
+            && !admitted_plan.items.is_empty()
+        {
+            return fail("Cannot downgrade a non-empty deep plan.");
+        }
+        staged_plan.mode = mode;
+    }
+    let specs = debug_specs(if parsed.op == "expand" {
+        parsed.children
+    } else {
+        parsed.nodes
+    });
+    let parent = node_id
+        .and_then(|id| admitted_plan.node_meta.get(id))
+        .cloned()
+        .unwrap_or_default();
+    let generates_gate = matches!(parsed.op.as_str(), "seed" | "expand")
+        && staged_plan.mode.eq_ignore_ascii_case("deep");
+    let allowed = if parsed.op != "complete" {
+        match super::comm_graph::validate_graph_specs(
+            &actor,
+            &specs,
+            &parent,
+            generates_gate,
+            ctx.sessions,
+            ctx.swarm_members,
+            ctx.provider_template,
+        )
+        .await
+        {
+            Ok(allowed) => allowed,
+            Err(error) => return fail(error),
+        }
+    } else {
+        parent.allowed_models.clone()
+    };
+    let count = if parsed.op == "complete" {
+        1
+    } else {
+        specs.len()
+    };
+    let mut graph = to_task_graph(&staged_plan);
+    let before = graph.clone();
+    if let Some(node_id) = node_id {
+        super::comm_graph::pin_graph_actor(&mut graph, node_id, actor_routing.as_ref());
+        super::comm_graph::claim_queued_node_for_actor(&mut graph, node_id, &actor);
+    }
+    let result = match parsed.op.as_str() {
+        "seed" => dag::seed(&mut graph, specs),
+        "expand" => dag::expand_node(&mut graph, node_id.unwrap(), &actor, specs).map(|_| ()),
+        "inject" => dag::inject_from_gate(&mut graph, node_id.unwrap(), &actor, specs).map(|_| ()),
+        "complete" => {
+            let artifact =
+                match serde_json::from_value(parsed.artifact.unwrap_or(serde_json::json!({}))) {
                     Ok(artifact) => artifact,
-                    Err(e) => return fail(format!("invalid artifact: {e}")),
+                    Err(error) => return fail(format!("invalid artifact: {error}")),
                 };
-                if let Some(item) = plan.items.iter_mut().find(|i| i.id == node_id) {
-                    item.assigned_to = Some(actor.clone());
-                    item.status = "running".to_string();
-                }
-                let mut graph = to_task_graph(plan);
-                match dag::complete_node(&mut graph, &node_id, &actor, artifact) {
-                    Ok(()) => {
-                        apply_task_graph(plan, &graph);
-                        plan.version += 1;
-                        Ok((1, "complete"))
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
+            dag::complete_node(&mut graph, node_id.unwrap(), &actor, artifact)
+        }
+        other => return fail(format!("unknown op '{other}'")),
+    };
+    let result: Result<(usize, &str), String> = match result {
+        Err(error) => Err(error.to_string()),
+        Ok(()) if graph.len() > jcode_plan::MAX_PLAN_ITEMS => {
+            Err("Graph exceeds per-swarm node limit".into())
+        }
+        Ok(()) => {
+            super::comm_graph::restrict_new_graph_nodes(&mut graph, &before, allowed.as_deref());
+            apply_task_graph(&mut staged_plan, &graph);
+            staged_plan.version += 1;
+            let mut plans = ctx.swarm_plans.write().await;
+            if plans.get(&swarm_id).map_or(0, |plan| plan.version) != admitted_plan.version {
+                return fail("Plan changed during admission; retry graph operation.");
             }
-            "inject" => {
-                let Some(actor) = parsed.actor.clone() else {
-                    return fail("'actor' required");
-                };
-                let Some(gate_id) = parsed.gate_id.clone() else {
-                    return fail("'gate_id' required");
-                };
-                let count = parsed.nodes.len();
-                if let Some(item) = plan.items.iter_mut().find(|i| i.id == gate_id) {
-                    item.assigned_to = Some(actor.clone());
-                    item.status = "running".to_string();
-                }
-                let mut graph = to_task_graph(plan);
-                match dag::inject_from_gate(&mut graph, &gate_id, &actor, debug_specs(parsed.nodes))
-                {
-                    Ok(_) => {
-                        apply_task_graph(plan, &graph);
-                        plan.version += 1;
-                        Ok((count, "inject"))
-                    }
-                    Err(e) => Err(e.to_string()),
-                }
-            }
-            other => Err(format!("unknown op '{other}'")),
+            plans.insert(swarm_id.clone(), staged_plan);
+            Ok((count, parsed.op.as_str()))
         }
     };
 
@@ -712,6 +748,42 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn routing_debug_specs_keep_requests_but_not_spoofed_policy_or_pin() {
+        let specs: Vec<DebugNodeSpec> = serde_json::from_value(serde_json::json!([{
+            "id":"a", "content":"work", "model":"gpt-6-astra", "effort":"medium",
+            "allowed_models":[], "resolved_execution":{"model":"spoof"}
+        }]))
+        .unwrap();
+        let specs = debug_specs(specs);
+        assert_eq!(specs[0].model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(specs[0].effort.as_deref(), Some("medium"));
+        let mut graph = jcode_plan::dag::TaskGraph::new(jcode_plan::dag::Mode::Light);
+        jcode_plan::dag::seed(&mut graph, specs).unwrap();
+        assert!(graph.get("a").unwrap().allowed_models.is_none());
+        assert!(graph.get("a").unwrap().resolved_execution.is_none());
+    }
+
+    struct TestProvider;
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for TestProvider {
+        async fn complete(
+            &self,
+            _: &[crate::message::Message],
+            _: &[crate::message::ToolDefinition],
+            _: &str,
+            _: Option<&str>,
+        ) -> anyhow::Result<crate::provider::EventStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn fork(&self) -> Arc<dyn crate::provider::Provider> {
+            Arc::new(Self)
+        }
+    }
 
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -754,6 +826,8 @@ mod tests {
         )])));
         let ctx = DebugSwarmWriteContext {
             session_id: &session_id,
+            sessions: &Arc::new(RwLock::new(HashMap::new())),
+            provider_template: &(Arc::new(TestProvider) as Arc<dyn crate::provider::Provider>),
             swarm_members: &swarm_members,
             swarms_by_id: &swarms_by_id,
             shared_context: &shared_context,

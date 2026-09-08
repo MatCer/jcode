@@ -55,6 +55,7 @@ async fn task_control_wake_returns_structured_response_with_plan_summary() {
         Some("continue".to_string()),
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -76,6 +77,7 @@ async fn task_control_wake_returns_structured_response_with_plan_summary() {
             target_session,
             status,
             summary,
+            ..
         } => {
             assert_eq!(id, 101);
             assert_eq!(action, "wake");
@@ -146,6 +148,7 @@ async fn task_control_resume_without_task_id_uses_unique_target_assignment() {
         None,
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -233,6 +236,7 @@ async fn task_control_without_task_id_rejects_ambiguous_target_assignments() {
         None,
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -333,6 +337,7 @@ async fn task_control_resume_busy_agent_rejects_without_mutating_plan() {
         None,
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -541,6 +546,7 @@ async fn task_control_retry_re_dispatches_after_recent_identical_retry() {
                 None,
                 &client_tx,
                 &sessions,
+                &(Arc::new(TestProvider) as Arc<dyn Provider>),
                 &soft_interrupt_queues,
                 &client_connections,
                 &swarm_members,

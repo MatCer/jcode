@@ -71,9 +71,12 @@ async fn assign_task_without_target_picks_ready_agent() {
         requester.to_string(),
         None,
         None,
+        None,
+        None,
         Some("Pick a task and worker".to_string()),
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -92,6 +95,7 @@ async fn assign_task_without_target_picks_ready_agent() {
             id,
             task_id,
             target_session,
+            ..
         } => {
             assert_eq!(id, 99);
             assert_eq!(task_id, "next");

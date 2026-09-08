@@ -73,6 +73,7 @@ fn member(session_id: &str, swarm_id: &str, status: &str) -> SwarmMember {
         todo_items: Vec::new(),
         runtime: crate::protocol::SwarmMemberRuntime::default(),
         task_label: None,
+        allowed_models: None,
     }
 }
 
@@ -164,3 +165,5 @@ include!("comm_control_tests/await_upgrade_background.rs");
 include!("comm_control_tests/dag_e2e.rs");
 include!("comm_control_tests/auto_worker_filter.rs");
 include!("comm_control_tests/client_attached_dispatch.rs");
+
+include!("comm_control_tests/routing.rs");

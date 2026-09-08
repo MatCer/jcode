@@ -38,6 +38,38 @@ fn plan_cycle_error(items: &[PlanItem]) -> Option<String> {
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "legacy plan admission uses the same routing policy as DAG specs"
+)]
+async fn admit_legacy_plan_items(
+    requester: &str,
+    items: &[PlanItem],
+    plan: &VersionedPlan,
+    inherited: Option<Vec<String>>,
+    sessions: &SessionAgents,
+    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    provider: &Arc<dyn crate::provider::Provider>,
+) -> anyhow::Result<HashMap<String, jcode_plan::NodeMeta>> {
+    let mut metadata = HashMap::new();
+    for item in items {
+        if plan.items.iter().any(|existing| existing.id == item.id) {
+            continue;
+        }
+        let mut meta = jcode_plan::NodeMeta {
+            allowed_models: inherited.clone(),
+            ..Default::default()
+        };
+        let routing = super::comm_control::admit_node_execution(
+            requester, &meta, None, None, None, sessions, members, provider,
+        )
+        .await?;
+        meta.allowed_models = routing.allowed_models;
+        metadata.insert(item.id.clone(), meta);
+    }
+    Ok(metadata)
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "plan proposal updates sessions, swarm coordination, shared context, interrupts, and event history"
 )]
 pub(super) async fn handle_comm_propose_plan(
@@ -56,6 +88,7 @@ pub(super) async fn handle_comm_propose_plan(
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
     _swarm_mutation_runtime: &SwarmMutationRuntime,
+    provider_template: &Arc<dyn crate::provider::Provider>,
 ) {
     let swarm_id = {
         let members = swarm_members.read().await;
@@ -113,11 +146,47 @@ pub(super) async fn handle_comm_propose_plan(
             });
             return;
         }
+        let admitted_plan = swarm_plans
+            .read()
+            .await
+            .get(&swarm_id)
+            .cloned()
+            .unwrap_or_default();
+        let metadata = match admit_legacy_plan_items(
+            &req_session_id,
+            &items,
+            &admitted_plan,
+            None,
+            sessions,
+            swarm_members,
+            provider_template,
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message: format!("Plan routing rejected: {error}"),
+                    retry_after_secs: None,
+                });
+                return;
+            }
+        };
         let (version, participant_ids) = {
             let mut plans = swarm_plans.write().await;
             let plan = plans
                 .entry(swarm_id.clone())
                 .or_insert_with(VersionedPlan::new);
+            if plan.version != admitted_plan.version {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message: "Plan changed during admission; retry update.".into(),
+                    retry_after_secs: None,
+                });
+                return;
+            }
+            plan.node_meta.extend(metadata);
             plan.participants.insert(req_session_id.clone());
             for item in &items {
                 if let Some(owner) = &item.assigned_to {
@@ -330,6 +399,7 @@ pub(super) async fn handle_comm_approve_plan(
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
     swarm_mutation_runtime: &SwarmMutationRuntime,
+    provider_template: &Arc<dyn crate::provider::Provider>,
 ) {
     let swarm_id = match require_coordinator_swarm(
         id,
@@ -369,10 +439,10 @@ pub(super) async fn handle_comm_approve_plan(
         context
             .get(&swarm_id)
             .and_then(|swarm_context| swarm_context.get(&proposal_key))
-            .map(|context| context.value.clone())
+            .map(|context| (context.value.clone(), context.from_session.clone()))
     };
 
-    let proposal = match proposal_value {
+    let (proposal, proposal_author) = match proposal_value {
         Some(proposal) => proposal,
         None => {
             finish_request(
@@ -388,6 +458,38 @@ pub(super) async fn handle_comm_approve_plan(
         }
     };
 
+    let author_allowed = if proposal_author != proposer_session {
+        Err(anyhow::anyhow!(
+            "Proposal provenance does not match its author; ask the author to re-propose."
+        ))
+    } else {
+        let members = swarm_members.read().await;
+        if !members
+            .get(&proposer_session)
+            .is_some_and(|member| member.swarm_id.as_deref() == Some(&swarm_id))
+        {
+            Err(anyhow::anyhow!(
+                "Proposal author is unavailable; ask a live member to re-propose."
+            ))
+        } else {
+            super::comm_session::effective_swarm_allowed_models(
+                &members,
+                &proposer_session,
+                None,
+                None,
+                &provider_template.model_routes(),
+            )
+        }
+    };
+    let author_allowed = match author_allowed {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            finish_request(swarm_mutation_runtime, &mutation_state, PersistedSwarmMutationResponse::Error {
+                message: format!("Proposal routing provenance rejected: {error}. Re-propose from a live trusted session."), retry_after_secs: None,
+            }).await;
+            return;
+        }
+    };
     if let Ok(items) = serde_json::from_str::<Vec<PlanItem>>(&proposal) {
         let existing_count = swarm_plans
             .read()
@@ -437,11 +539,56 @@ pub(super) async fn handle_comm_approve_plan(
             return;
         }
 
+        let admitted_plan = swarm_plans
+            .read()
+            .await
+            .get(&swarm_id)
+            .cloned()
+            .unwrap_or_default();
+        let metadata = match admit_legacy_plan_items(
+            &req_session_id,
+            &items,
+            &admitted_plan,
+            author_allowed,
+            sessions,
+            swarm_members,
+            provider_template,
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                finish_request(
+                    swarm_mutation_runtime,
+                    &mutation_state,
+                    PersistedSwarmMutationResponse::Error {
+                        message: format!("Proposal routing rejected: {error}"),
+                        retry_after_secs: None,
+                    },
+                )
+                .await;
+                return;
+            }
+        };
         let participant_ids = {
             let mut plans = swarm_plans.write().await;
             let plan = plans
                 .entry(swarm_id.clone())
                 .or_insert_with(VersionedPlan::new);
+            if plan.version != admitted_plan.version {
+                drop(plans);
+                finish_request(
+                    swarm_mutation_runtime,
+                    &mutation_state,
+                    PersistedSwarmMutationResponse::Error {
+                        message: "Plan changed during admission; retry approval.".into(),
+                        retry_after_secs: None,
+                    },
+                )
+                .await;
+                return;
+            }
+            plan.node_meta.extend(metadata);
             plan.items.extend(items.clone());
             plan.version += 1;
             plan.participants.insert(req_session_id.clone());

@@ -52,7 +52,10 @@ fn auto_pick_with_only_busy_workers_reports_no_target_for_spawn_fallback() {
         err.starts_with("No ready or completed swarm agents are available"),
         "unexpected error: {err}"
     );
-    assert!(err.contains("Skipped 1 worker(s)"), "unexpected error: {err}");
+    assert!(
+        err.contains("Skipped 1 worker(s)"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -155,9 +158,12 @@ async fn assign_task_does_not_stack_on_busy_worker() {
         requester.to_string(),
         None,
         None,
+        None,
+        None,
         Some("Do not stack this onto the busy worker".to_string()),
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,

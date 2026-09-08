@@ -2382,6 +2382,7 @@ pub(super) async fn handle_client(
                     &event_counter,
                     &swarm_event_tx,
                     &swarm_mutation_runtime,
+                    &provider_template,
                 )
                 .await;
             }
@@ -2407,6 +2408,7 @@ pub(super) async fn handle_client(
                     &event_counter,
                     &swarm_event_tx,
                     &swarm_mutation_runtime,
+                    &provider_template,
                 )
                 .await;
             }
@@ -2455,6 +2457,8 @@ pub(super) async fn handle_client(
                     &event_history,
                     &event_counter,
                     &swarm_event_tx,
+                    &sessions,
+                    &provider_template,
                 )
                 .await;
             }
@@ -2478,6 +2482,8 @@ pub(super) async fn handle_client(
                     &event_history,
                     &event_counter,
                     &swarm_event_tx,
+                    &sessions,
+                    &provider_template,
                 )
                 .await;
             }
@@ -2501,6 +2507,8 @@ pub(super) async fn handle_client(
                     &event_history,
                     &event_counter,
                     &swarm_event_tx,
+                    &sessions,
+                    &provider_template,
                 )
                 .await;
             }
@@ -2524,6 +2532,8 @@ pub(super) async fn handle_client(
                     &event_history,
                     &event_counter,
                     &swarm_event_tx,
+                    &sessions,
+                    &provider_template,
                 )
                 .await;
             }
@@ -2789,6 +2799,7 @@ pub(super) async fn handle_client(
                     message,
                     &client_event_tx,
                     &sessions,
+                    &provider_template,
                     &soft_interrupt_queues,
                     &client_connections,
                     &swarm_members,
@@ -2862,6 +2873,7 @@ pub(super) async fn handle_client(
                     message,
                     &client_event_tx,
                     &sessions,
+                    &provider_template,
                     &soft_interrupt_queues,
                     &client_connections,
                     &swarm_members,

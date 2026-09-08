@@ -356,6 +356,9 @@ pub struct TaskNode {
     /// Server-selected durable identity. Never copied to newly generated work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_execution: Option<crate::ResolvedExecution>,
+    /// Trusted server snapshot of inherited node restrictions. Never accepted from wire specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
     pub id: NodeId,
     /// The task prompt/instructions for the worker.
     pub content: String,

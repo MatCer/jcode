@@ -29,6 +29,160 @@ fn spec_from_wire(spec: TaskGraphNodeSpec) -> NodeSpec {
         kind: parse_kind(spec.kind.as_deref()),
         depends_on: spec.depends_on,
         priority: spec.priority,
+        model: spec.model,
+        effort: spec.effort,
+    }
+}
+
+/// Admission is read-only. A failed batch never creates nodes, elects a
+/// coordinator, or claims a queued parent. Generated gates use default routing
+/// but inherit the same trusted restrictions as the actor's new children.
+pub(super) async fn validate_graph_specs(
+    actor: &str,
+    specs: &[NodeSpec],
+    parent: &jcode_plan::NodeMeta,
+    generates_gate: bool,
+    sessions: &super::SessionAgents,
+    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    provider: &Arc<dyn crate::provider::Provider>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let mut allowed = parent.allowed_models.clone();
+    for spec in specs {
+        let meta = jcode_plan::NodeMeta {
+            model: spec.model.clone(),
+            effort: spec.effort.clone(),
+            allowed_models: parent.allowed_models.clone(),
+            ..Default::default()
+        };
+        let routing = super::comm_control::admit_node_execution(
+            actor, &meta, None, None, None, sessions, members, provider,
+        )
+        .await?;
+        allowed = routing.allowed_models;
+    }
+    if generates_gate {
+        let meta = jcode_plan::NodeMeta {
+            allowed_models: allowed.clone(),
+            ..Default::default()
+        };
+        allowed = super::comm_control::admit_node_execution(
+            actor, &meta, None, None, None, sessions, members, provider,
+        )
+        .await?
+        .allowed_models;
+    }
+    Ok(allowed)
+}
+
+pub(super) fn restrict_new_graph_nodes(
+    graph: &mut TaskGraph,
+    before: &TaskGraph,
+    allowed: Option<&[String]>,
+) {
+    let mut updated = TaskGraph::new(graph.mode);
+    for mut node in graph.nodes().iter().cloned() {
+        if !before.contains(&node.id) {
+            node.allowed_models = allowed.map(<[String]>::to_vec);
+        }
+        updated.push_node(node);
+    }
+    *graph = updated;
+}
+
+/// Self-claiming a queued node is an execution boundary too. Already running
+/// work can submit its artifact after policy tightening without being revoked.
+pub(super) async fn validate_graph_actor(
+    actor: &str,
+    node_id: &str,
+    plan: &VersionedPlan,
+    sessions: &super::SessionAgents,
+    members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    provider: &Arc<dyn crate::provider::Provider>,
+) -> anyhow::Result<Option<crate::protocol::SwarmRoutingStatus>> {
+    let graph = to_task_graph(plan);
+    let node = graph
+        .get(node_id)
+        .ok_or_else(|| anyhow::anyhow!("Unknown node '{node_id}'"))?;
+    if node.status != NodeStatus::Queued {
+        return Ok(None);
+    }
+    if node.owner.as_deref().is_some_and(|owner| owner != actor) {
+        anyhow::bail!("Actor does not own node '{node_id}'.");
+    }
+    // Claiming assigned work is not recursive spawning. Resolve its policy
+    // through the trusted root plus the node snapshot and actor restrictions.
+    let ancestry = super::swarm::trusted_swarm_ancestry(&*members.read().await, actor)?;
+    let root = ancestry
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Missing trusted root"))?;
+    let meta = plan.node_meta.get(node_id).cloned().unwrap_or_default();
+    let mut routing = super::comm_control::admit_node_execution(
+        root, &meta, None, None, None, sessions, members, provider,
+    )
+    .await?;
+    let actor_allowed = super::comm_session::effective_swarm_allowed_models(
+        &*members.read().await,
+        actor,
+        None,
+        None,
+        &provider.model_routes(),
+    )?;
+    routing.allowed_models = super::comm_control::intersect_node_allowed_models(
+        routing.allowed_models.as_deref(),
+        actor_allowed.as_deref(),
+        &provider.model_routes(),
+    );
+    let compatible = super::comm_control::compatible_node_candidates(
+        &routing,
+        meta.resolved_execution.is_some(),
+        sessions,
+        members,
+        provider,
+    )
+    .await;
+    routing.actual_execution = compatible.get(actor).cloned().ok_or_else(||
+        anyhow::anyhow!("Actor '{actor}' has no compatible initialized model/provider/API/effort for node '{node_id}'."))?;
+    Ok(Some(routing))
+}
+
+pub(super) fn pin_graph_actor(
+    graph: &mut TaskGraph,
+    node_id: &str,
+    routing: Option<&crate::protocol::SwarmRoutingStatus>,
+) {
+    let Some(routing) = routing else { return };
+    let mut updated = TaskGraph::new(graph.mode);
+    for mut node in graph.nodes().iter().cloned() {
+        if node.id == node_id {
+            if node.resolved_execution.is_none() {
+                node.resolved_execution = routing.actual_execution.clone();
+            }
+            node.allowed_models = routing.allowed_models.clone();
+        }
+        updated.push_node(node);
+    }
+    *graph = updated;
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn routing_graph_adapter_preserves_requested_model_and_effort_only() {
+        let wire: TaskGraphNodeSpec = serde_json::from_value(serde_json::json!({
+            "id":"a", "content":"work", "model":"gpt-6-astra", "effort":"medium",
+            "resolved_execution":{"model":"spoof"}, "allowed_models":[]
+        }))
+        .unwrap();
+        let spec = spec_from_wire(wire);
+        assert_eq!(spec.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(spec.effort.as_deref(), Some("medium"));
+        let mut graph = TaskGraph::new(dag::Mode::Light);
+        dag::seed(&mut graph, vec![spec]).unwrap();
+        let node = graph.get("a").unwrap();
+        assert!(node.resolved_execution.is_none());
+        assert!(node.allowed_models.is_none());
     }
 }
 
@@ -135,7 +289,7 @@ async fn ensure_seeder_can_coordinate(
 /// queued, with every dependency done (enforced by `dispatch`), and either
 /// unowned or already assigned to this same actor. A node owned by someone else
 /// is never touched — the engine's `NotOwner` check still applies.
-fn claim_queued_node_for_actor(graph: &mut TaskGraph, node_id: &str, actor: &str) {
+pub(super) fn claim_queued_node_for_actor(graph: &mut TaskGraph, node_id: &str, actor: &str) {
     let claimable = graph.get(node_id).is_some_and(|node| {
         node.status == NodeStatus::Queued
             && node.owner.as_deref().is_none_or(|owner| owner == actor)
@@ -231,22 +385,13 @@ pub(super) async fn handle_comm_seed_graph(
     event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    sessions: &super::SessionAgents,
+    provider_template: &Arc<dyn crate::provider::Provider>,
 ) {
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
         return;
     };
-
-    // A deep-mode seeder is usually a solo agent. Elect it coordinator (when no
-    // live coordinator exists) so it can actually dispatch the graph it seeds via
-    // the coordinator-gated assign/run_plan paths.
-    ensure_seeder_can_coordinate(
-        &swarm_id,
-        &req_session_id,
-        swarm_members,
-        swarm_coordinators,
-    )
-    .await;
 
     let specs: Vec<NodeSpec> = nodes.into_iter().map(spec_from_wire).collect();
     let count = specs.len();
@@ -263,11 +408,41 @@ pub(super) async fn handle_comm_seed_graph(
             .map(|_| "deep".to_string())
     });
 
+    let current_mode = swarm_plans
+        .read()
+        .await
+        .get(&swarm_id)
+        .map(|plan| plan.mode.clone())
+        .unwrap_or_else(|| "light".into());
+    let generates_gate = resolved_mode
+        .as_deref()
+        .unwrap_or(&current_mode)
+        .eq_ignore_ascii_case("deep");
+    let allowed = match validate_graph_specs(
+        &req_session_id,
+        &specs,
+        &jcode_plan::NodeMeta::default(),
+        generates_gate,
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            err(
+                client_event_tx,
+                id,
+                format!("Seed routing rejected: {error}"),
+            );
+            return;
+        }
+    };
     let result = {
         let mut plans = swarm_plans.write().await;
-        let plan = plans
-            .entry(swarm_id.clone())
-            .or_insert_with(VersionedPlan::new);
+        let mut staged_plan = plans.get(&swarm_id).cloned().unwrap_or_default();
+        let plan = &mut staged_plan;
         if let Some(mode) = resolved_mode {
             // Guard against silent rigor downgrades: re-seeding an existing deep
             // plan as light would strip the gates + artifact validation from all
@@ -298,9 +473,11 @@ pub(super) async fn handle_comm_seed_graph(
                 Some(message) => Err(message),
                 None => {
                     if graph != before {
+                        restrict_new_graph_nodes(&mut graph, &before, allowed.as_deref());
                         apply_task_graph(plan, &graph);
                         plan.version += 1;
                     }
+                    plans.insert(swarm_id.clone(), staged_plan);
                     Ok(())
                 }
             },
@@ -310,6 +487,17 @@ pub(super) async fn handle_comm_seed_graph(
 
     match result {
         Ok(()) => {
+            // A deep-mode seeder is usually a solo agent. Elect it coordinator (when no
+            // live coordinator exists) so it can actually dispatch the graph it seeds via
+            // the coordinator-gated assign/run_plan paths.
+            ensure_seeder_can_coordinate(
+                &swarm_id,
+                &req_session_id,
+                swarm_members,
+                swarm_coordinators,
+            )
+            .await;
+
             finalize(
                 id,
                 &swarm_id,
@@ -349,6 +537,8 @@ pub(super) async fn handle_comm_expand_node(
     event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    sessions: &super::SessionAgents,
+    provider_template: &Arc<dyn crate::provider::Provider>,
 ) {
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
@@ -357,18 +547,79 @@ pub(super) async fn handle_comm_expand_node(
     let specs: Vec<NodeSpec> = children.into_iter().map(spec_from_wire).collect();
     let count = specs.len();
 
+    let Some(admitted_plan) = swarm_plans.read().await.get(&swarm_id).cloned() else {
+        err(client_event_tx, id, "No plan for this swarm.".into());
+        return;
+    };
+    let actor_routing = match validate_graph_actor(
+        &req_session_id,
+        &node_id,
+        &admitted_plan,
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(routing) => routing,
+        Err(error) => {
+            err(
+                client_event_tx,
+                id,
+                format!("Node execution rejected: {error}"),
+            );
+            return;
+        }
+    };
+    let parent = admitted_plan
+        .node_meta
+        .get(&node_id)
+        .cloned()
+        .unwrap_or_default();
+    let allowed = match validate_graph_specs(
+        &req_session_id,
+        &specs,
+        &parent,
+        true && admitted_plan.mode.eq_ignore_ascii_case("deep"),
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            err(
+                client_event_tx,
+                id,
+                format!("Graph routing rejected: {error}"),
+            );
+            return;
+        }
+    };
     let result = {
         let mut plans = swarm_plans.write().await;
         let Some(plan) = plans.get_mut(&swarm_id) else {
             err(client_event_tx, id, "No plan for this swarm.".to_string());
             return;
         };
+        if plan.version != admitted_plan.version {
+            err(
+                client_event_tx,
+                id,
+                "Plan changed during admission; retry graph operation.".into(),
+            );
+            return;
+        }
         let mut graph = to_task_graph(plan);
+        let before = graph.clone();
+        pin_graph_actor(&mut graph, &node_id, actor_routing.as_ref());
         claim_queued_node_for_actor(&mut graph, &node_id, &req_session_id);
         match dag::expand_node(&mut graph, &node_id, &req_session_id, specs) {
             Ok(_) => match graph_size_error(&graph) {
                 Some(message) => Err(message),
                 None => {
+                    restrict_new_graph_nodes(&mut graph, &before, allowed.as_deref());
                     apply_task_graph(plan, &graph);
                     plan.version += 1;
                     Ok(())
@@ -419,6 +670,8 @@ pub(super) async fn handle_comm_complete_node(
     event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    sessions: &super::SessionAgents,
+    provider_template: &Arc<dyn crate::provider::Provider>,
 ) {
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
@@ -433,13 +686,46 @@ pub(super) async fn handle_comm_complete_node(
         }
     };
 
+    let Some(admitted_plan) = swarm_plans.read().await.get(&swarm_id).cloned() else {
+        err(client_event_tx, id, "No plan for this swarm.".into());
+        return;
+    };
+    let actor_routing = match validate_graph_actor(
+        &req_session_id,
+        &node_id,
+        &admitted_plan,
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(routing) => routing,
+        Err(error) => {
+            err(
+                client_event_tx,
+                id,
+                format!("Node execution rejected: {error}"),
+            );
+            return;
+        }
+    };
     let result = {
         let mut plans = swarm_plans.write().await;
         let Some(plan) = plans.get_mut(&swarm_id) else {
             err(client_event_tx, id, "No plan for this swarm.".to_string());
             return;
         };
+        if plan.version != admitted_plan.version {
+            err(
+                client_event_tx,
+                id,
+                "Plan changed during admission; retry graph operation.".into(),
+            );
+            return;
+        }
         let mut graph = to_task_graph(plan);
+        pin_graph_actor(&mut graph, &node_id, actor_routing.as_ref());
         claim_queued_node_for_actor(&mut graph, &node_id, &req_session_id);
         match dag::complete_node(&mut graph, &node_id, &req_session_id, artifact) {
             Ok(()) => {
@@ -492,6 +778,8 @@ pub(super) async fn handle_comm_inject_gap(
     event_history: &Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: &broadcast::Sender<SwarmEvent>,
+    sessions: &super::SessionAgents,
+    provider_template: &Arc<dyn crate::provider::Provider>,
 ) {
     let Some(swarm_id) = swarm_id_for(&req_session_id, swarm_members).await else {
         err(client_event_tx, id, "Not in a swarm.".to_string());
@@ -500,18 +788,79 @@ pub(super) async fn handle_comm_inject_gap(
     let specs: Vec<NodeSpec> = nodes.into_iter().map(spec_from_wire).collect();
     let count = specs.len();
 
+    let Some(admitted_plan) = swarm_plans.read().await.get(&swarm_id).cloned() else {
+        err(client_event_tx, id, "No plan for this swarm.".into());
+        return;
+    };
+    let actor_routing = match validate_graph_actor(
+        &req_session_id,
+        &gate_id,
+        &admitted_plan,
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(routing) => routing,
+        Err(error) => {
+            err(
+                client_event_tx,
+                id,
+                format!("Node execution rejected: {error}"),
+            );
+            return;
+        }
+    };
+    let parent = admitted_plan
+        .node_meta
+        .get(&gate_id)
+        .cloned()
+        .unwrap_or_default();
+    let allowed = match validate_graph_specs(
+        &req_session_id,
+        &specs,
+        &parent,
+        false && admitted_plan.mode.eq_ignore_ascii_case("deep"),
+        sessions,
+        swarm_members,
+        provider_template,
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            err(
+                client_event_tx,
+                id,
+                format!("Graph routing rejected: {error}"),
+            );
+            return;
+        }
+    };
     let result = {
         let mut plans = swarm_plans.write().await;
         let Some(plan) = plans.get_mut(&swarm_id) else {
             err(client_event_tx, id, "No plan for this swarm.".to_string());
             return;
         };
+        if plan.version != admitted_plan.version {
+            err(
+                client_event_tx,
+                id,
+                "Plan changed during admission; retry graph operation.".into(),
+            );
+            return;
+        }
         let mut graph = to_task_graph(plan);
+        let before = graph.clone();
+        pin_graph_actor(&mut graph, &gate_id, actor_routing.as_ref());
         claim_queued_node_for_actor(&mut graph, &gate_id, &req_session_id);
         match dag::inject_from_gate(&mut graph, &gate_id, &req_session_id, specs) {
             Ok(_) => match graph_size_error(&graph) {
                 Some(message) => Err(message),
                 None => {
+                    restrict_new_graph_nodes(&mut graph, &before, allowed.as_deref());
                     apply_task_graph(plan, &graph);
                     plan.version += 1;
                     Ok(())

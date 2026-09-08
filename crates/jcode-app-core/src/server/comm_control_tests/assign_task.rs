@@ -50,9 +50,12 @@ async fn assign_task_without_task_id_picks_highest_priority_runnable_task() {
         requester.to_string(),
         Some(worker.to_string()),
         None,
+        None,
+        None,
         Some("Pick the next task".to_string()),
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -72,6 +75,7 @@ async fn assign_task_without_task_id_picks_highest_priority_runnable_task() {
             id,
             task_id,
             target_session,
+            ..
         } => {
             assert_eq!(id, 77);
             assert_eq!(task_id, "high-ready");
@@ -156,8 +160,11 @@ async fn assign_task_marks_completed_worker_queued_before_returning() {
         Some(worker.to_string()),
         Some("next".to_string()),
         None,
+        None,
+        None,
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -176,6 +183,7 @@ async fn assign_task_marks_completed_worker_queued_before_returning() {
             id,
             task_id,
             target_session,
+            ..
         } => {
             assert_eq!(id, 78);
             assert_eq!(task_id, "next");

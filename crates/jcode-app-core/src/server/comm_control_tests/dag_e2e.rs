@@ -18,6 +18,8 @@ fn node_spec(id: &str, kind: &str, deps: &[&str]) -> TaskGraphNodeSpec {
         kind: Some(kind.to_string()),
         depends_on: deps.iter().map(|d| d.to_string()).collect(),
         priority: 0,
+        model: None,
+        effort: None,
     }
 }
 
@@ -109,6 +111,8 @@ impl GraphFixture {
             &self.event_history,
             &self.event_counter,
             &self.swarm_event_tx,
+            &self.sessions,
+            &(Arc::new(TestProvider) as Arc<dyn Provider>),
         )
         .await;
     }
@@ -129,6 +133,8 @@ impl GraphFixture {
             &self.event_history,
             &self.event_counter,
             &self.swarm_event_tx,
+            &self.sessions,
+            &(Arc::new(TestProvider) as Arc<dyn Provider>),
         )
         .await;
     }
@@ -275,16 +281,23 @@ async fn e2e_identical_seed_replay_succeeds_without_version_or_node_churn() {
     drop(plans);
     let events: Vec<_> = std::iter::from_fn(|| fx.client_rx.try_recv().ok()).collect();
     assert!(
-        events.iter().all(|event| !matches!(event, ServerEvent::Error { .. })),
+        events
+            .iter()
+            .all(|event| !matches!(event, ServerEvent::Error { .. })),
         "an identical replay must acknowledge success: {events:?}"
     );
-    assert!(events.iter().any(|event| matches!(event, ServerEvent::Done { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ServerEvent::Done { .. }))
+    );
 }
 
 #[tokio::test]
 async fn e2e_seed_rejects_conflicting_existing_definition_without_mutation() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
-    let mut fx = graph_fixture_named("swarm-seed-conflict", "coord-conflict", "worker-conflict").await;
+    let mut fx =
+        graph_fixture_named("swarm-seed-conflict", "coord-conflict", "worker-conflict").await;
     fx.seed("light", vec![node_spec("shared", "explore", &[])])
         .await;
     while fx.client_rx.try_recv().is_ok() {}
@@ -370,8 +383,11 @@ async fn e2e_deep_expand_inserts_gate_in_live_plan() {
         Some(fx.worker.clone()),
         Some("root".to_string()),
         None,
+        None,
+        None,
         &fx.client_tx,
         &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &fx.soft_interrupt_queues,
         &fx.client_connections,
         &fx.swarm_members,
@@ -411,6 +427,8 @@ async fn e2e_deep_expand_inserts_gate_in_live_plan() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -456,8 +474,11 @@ async fn e2e_deep_assignment_carries_fanout_and_artifact_contract() {
         Some(fx.worker.clone()),
         Some("explore.a".to_string()),
         None,
+        None,
+        None,
         &fx.client_tx,
         &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &fx.soft_interrupt_queues,
         &fx.client_connections,
         &fx.swarm_members,
@@ -505,8 +526,11 @@ async fn e2e_deep_assignment_carries_fanout_and_artifact_contract() {
         Some(lfx.worker.clone()),
         Some("light.a".to_string()),
         None,
+        None,
+        None,
         &lfx.client_tx,
         &lfx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &lfx.soft_interrupt_queues,
         &lfx.client_connections,
         &lfx.swarm_members,
@@ -564,6 +588,8 @@ async fn e2e_deep_gate_assignment_carries_inject_gap_contract() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -593,6 +619,8 @@ async fn e2e_deep_gate_assignment_carries_inject_gap_contract() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -619,8 +647,11 @@ async fn e2e_deep_gate_assignment_carries_inject_gap_contract() {
         Some(fx.worker.clone()),
         Some(gate_id.clone()),
         None,
+        None,
+        None,
         &fx.client_tx,
         &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &fx.soft_interrupt_queues,
         &fx.client_connections,
         &fx.swarm_members,
@@ -680,8 +711,11 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
         Some(fx.worker.clone()),
         Some("api".to_string()),
         None,
+        None,
+        None,
         &fx.client_tx,
         &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &fx.soft_interrupt_queues,
         &fx.client_connections,
         &fx.swarm_members,
@@ -720,6 +754,8 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -744,8 +780,11 @@ async fn e2e_complete_flows_artifact_to_downstream_assignment() {
         Some(fx.worker.clone()),
         Some("ui".to_string()),
         None,
+        None,
+        None,
         &fx.client_tx,
         &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &fx.soft_interrupt_queues,
         &fx.client_connections,
         &fx.swarm_members,
@@ -818,6 +857,8 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -854,6 +895,8 @@ async fn e2e_composite_rewake_prefers_planner_via_assign_next() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -924,6 +967,8 @@ async fn e2e_solo_seeder_is_elected_coordinator_and_can_assign() {
         &event_history,
         &event_counter,
         &swarm_event_tx,
+        &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -945,8 +990,11 @@ async fn e2e_solo_seeder_is_elected_coordinator_and_can_assign() {
         Some(worker.clone()),
         Some("explore".to_string()),
         None,
+        None,
+        None,
         &client_tx,
         &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &soft_interrupt_queues,
         &client_connections,
         &swarm_members,
@@ -1011,6 +1059,7 @@ async fn e2e_seed_does_not_displace_live_coordinator() {
     let event_counter = Arc::new(AtomicU64::new(1));
     let swarm_event_tx = broadcast::channel(64).0;
 
+    let sessions = Arc::new(RwLock::new(HashMap::new()));
     // The non-coordinator worker seeds the graph.
     handle_comm_seed_graph(
         1,
@@ -1025,6 +1074,8 @@ async fn e2e_seed_does_not_displace_live_coordinator() {
         &event_history,
         &event_counter,
         &swarm_event_tx,
+        &sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -1068,8 +1119,11 @@ async fn e2e_deep_participant_can_assign_without_being_coordinator() {
         Some(fx.coord.clone()),
         Some("explore".to_string()),
         None,
+        None,
+        None,
         &fx.client_tx,
         &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &fx.soft_interrupt_queues,
         &fx.client_connections,
         &fx.swarm_members,
@@ -1117,8 +1171,11 @@ async fn e2e_light_non_coordinator_participant_cannot_assign() {
         Some(fx.coord.clone()),
         Some("task".to_string()),
         None,
+        None,
+        None,
         &fx.client_tx,
         &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
         &fx.soft_interrupt_queues,
         &fx.client_connections,
         &fx.swarm_members,
@@ -1189,6 +1246,8 @@ async fn e2e_solo_seeder_can_complete_its_own_seeded_node() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -1240,6 +1299,8 @@ async fn e2e_self_claim_does_not_steal_foreign_assignment() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -1289,6 +1350,8 @@ async fn e2e_assignee_can_complete_queued_assignment() {
         &fx.event_history,
         &fx.event_counter,
         &fx.swarm_event_tx,
+        &fx.sessions,
+        &(Arc::new(TestProvider) as Arc<dyn Provider>),
     )
     .await;
 
@@ -1314,7 +1377,10 @@ async fn e2e_seed_rejects_light_downgrade_of_nonempty_deep_plan() {
 
     let plans = fx.swarm_plans.read().await;
     let plan = &plans[&fx.swarm_id];
-    assert_eq!(plan.mode, "deep", "deep plan must not be downgraded to light");
+    assert_eq!(
+        plan.mode, "deep",
+        "deep plan must not be downgraded to light"
+    );
     assert!(
         plan.items.iter().all(|i| i.id != "b"),
         "the downgrade seed must be rejected wholesale"

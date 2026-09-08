@@ -18,6 +18,8 @@ pub(crate) enum PersistedSwarmMutationResponse {
     AssignTask {
         task_id: String,
         target_session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<crate::protocol::SwarmRoutingStatus>,
     },
     Error {
         message: String,
@@ -38,11 +40,12 @@ impl PersistedSwarmMutationResponse {
             Self::AssignTask {
                 task_id,
                 target_session,
+                routing,
             } => ServerEvent::CommAssignTaskResponse {
                 id,
                 task_id,
                 target_session,
-                routing: None,
+                routing,
             },
             Self::Error {
                 message,
@@ -142,6 +145,8 @@ fn clear_persisted_actual_execution(state: &mut PersistedSwarmMutationState) {
     if let Some(PersistedSwarmMutationResponse::Spawn {
         routing: Some(routing),
         ..
+    } | PersistedSwarmMutationResponse::AssignTask {
+        routing: Some(routing), ..
     }) = state.final_response.as_mut()
     {
         // A disk replay knows the pinned target, not a currently initialized

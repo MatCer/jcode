@@ -70,6 +70,7 @@ fn member(session_id: &str, swarm_id: &str, role: &str) -> SwarmMember {
         todo_items: Vec::new(),
         runtime: crate::protocol::SwarmMemberRuntime::default(),
         task_label: None,
+        allowed_models: None,
     }
 }
 
@@ -166,6 +167,7 @@ impl PlanFixture {
             &self.event_counter,
             &self.swarm_event_tx,
             &self.mutation_runtime,
+            &(Arc::new(PlanRoutingTestProvider) as Arc<dyn crate::provider::Provider>),
         )
         .await;
     }
@@ -187,6 +189,7 @@ impl PlanFixture {
             &self.event_counter,
             &self.swarm_event_tx,
             &self.mutation_runtime,
+            &(Arc::new(PlanRoutingTestProvider) as Arc<dyn crate::provider::Provider>),
         )
         .await;
     }
@@ -657,5 +660,96 @@ async fn direct_update_notification_is_lost_on_stale_cached_event_tx() {
     assert!(
         matches!(live_rx.try_recv(), Ok(ServerEvent::Done { id: 99 })),
         "fanout-delivered event should arrive on the live attachment"
+    );
+}
+
+struct PlanRoutingTestProvider;
+#[async_trait::async_trait]
+impl crate::provider::Provider for PlanRoutingTestProvider {
+    async fn complete(
+        &self,
+        _: &[crate::message::Message],
+        _: &[crate::message::ToolDefinition],
+        _: &str,
+        _: Option<&str>,
+    ) -> anyhow::Result<crate::provider::EventStream> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+    fn name(&self) -> &str {
+        "test"
+    }
+    fn fork(&self) -> Arc<dyn crate::provider::Provider> {
+        Arc::new(Self)
+    }
+}
+
+#[tokio::test]
+async fn routing_legacy_approval_missing_author_requires_reproposal() {
+    let (_env, _runtime) = RuntimeEnvGuard::new();
+    let mut fx = plan_fixture("routing-legacy-missing", "coord-lm", "worker-lm");
+    let worker = fx.worker.clone();
+    fx.propose(&worker, vec![plan_item("a", &[])]).await;
+    fx.drain_events();
+    fx.swarm_members.write().await.remove(&worker);
+    fx.approve(&worker).await;
+    assert!(
+        error_messages(&fx.drain_events())
+            .iter()
+            .any(|error| error.contains("re-propose"))
+    );
+    assert!(fx.plan_item_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn routing_legacy_approval_rejects_spoofed_shared_context_provenance() {
+    let (_env, _runtime) = RuntimeEnvGuard::new();
+    let mut fx = plan_fixture("routing-legacy-spoof", "coord-ls", "worker-ls");
+    let worker = fx.worker.clone();
+    fx.propose(&worker, vec![plan_item("a", &[])]).await;
+    fx.drain_events();
+    fx.shared_context
+        .write()
+        .await
+        .get_mut(&fx.swarm_id)
+        .unwrap()
+        .get_mut(&format!("plan_proposal:{worker}"))
+        .unwrap()
+        .from_session = fx.coord.clone();
+    fx.approve(&worker).await;
+    assert!(
+        error_messages(&fx.drain_events())
+            .iter()
+            .any(|error| error.contains("provenance"))
+    );
+    assert!(fx.plan_item_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn routing_legacy_direct_update_preserves_existing_node_pin() {
+    let (_env, _runtime) = RuntimeEnvGuard::new();
+    let fx = plan_fixture("routing-legacy-pin", "coord-lp", "worker-lp");
+    let meta = jcode_plan::NodeMeta {
+        model: Some("gpt-6-astra".into()),
+        effort: Some("medium".into()),
+        allowed_models: Some(vec!["gpt-6-astra".into()]),
+        resolved_execution: Some(jcode_plan::ResolvedExecution {
+            model: "gpt-6-astra".into(),
+            provider_key: "openai-oauth".into(),
+            provider_label: "OpenAI".into(),
+            api_method: "openai-oauth".into(),
+            effort: Some("medium".into()),
+        }),
+        ..Default::default()
+    };
+    {
+        let mut plans = fx.swarm_plans.write().await;
+        let plan = plans.get_mut(&fx.swarm_id).unwrap();
+        plan.items.push(plan_item("a", &[]));
+        plan.node_meta.insert("a".into(), meta.clone());
+    }
+    fx.propose(&fx.coord, vec![plan_item("a", &[])]).await;
+    assert_eq!(
+        fx.swarm_plans.read().await[&fx.swarm_id].node_meta["a"],
+        meta
     );
 }

@@ -153,6 +153,7 @@ async fn control_driven_begin_re_dispatches_despite_persisted_final_state() {
         PersistedSwarmMutationResponse::AssignTask {
             task_id: "task-1".to_string(),
             target_session: "worker-1".to_string(),
+            routing: None,
         },
     )
     .await;
@@ -281,4 +282,59 @@ async fn routing_mutation_replay_does_not_claim_a_restored_actual_identity() {
     assert!(
         matches!(rx.recv().await, Some(ServerEvent::CommSpawnResponse { routing: Some(routing), .. }) if routing.actual_execution.is_none() && routing.resolved_execution.is_some())
     );
+}
+
+#[tokio::test]
+async fn routing_assignment_replay_keeps_pin_without_stale_actual() {
+    let (_env, _dir) = RuntimeEnvGuard::new();
+    let runtime = SwarmMutationRuntime::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = begin_or_replay(&runtime, "assignment-actual-replay", "assign_task", "coord", 1, &tx)
+        .await
+        .unwrap();
+    let target = jcode_plan::ResolvedExecution {
+        model: "gpt-5.5".into(),
+        provider_key: "openai-oauth".into(),
+        api_method: "openai-oauth".into(),
+        provider_label: "OpenAI".into(),
+        effort: Some("medium".into()),
+    };
+    finish_request(
+        &runtime,
+        &state,
+        PersistedSwarmMutationResponse::AssignTask {
+            task_id: "task".into(),
+            target_session: "child".into(),
+            routing: Some(crate::protocol::SwarmRoutingStatus {
+                resolved_execution: Some(target.clone()),
+                actual_execution: Some(target),
+                ..Default::default()
+            }),
+        },
+    )
+    .await;
+    assert!(
+        matches!(rx.recv().await, Some(ServerEvent::CommAssignTaskResponse { routing: Some(routing), .. }) if routing.actual_execution.is_some())
+    );
+    assert!(
+        begin_or_replay(
+            &SwarmMutationRuntime::default(),
+            "assignment-actual-replay",
+            "assign_task",
+            "coord",
+            2,
+            &tx
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        matches!(rx.recv().await, Some(ServerEvent::CommAssignTaskResponse { routing: Some(routing), .. }) if routing.actual_execution.is_none() && routing.resolved_execution.is_some())
+    );
+}
+
+#[test]
+fn routing_old_assignment_response_deserializes_without_routing() {
+    let response: PersistedSwarmMutationResponse = serde_json::from_str(r#"{"AssignTask":{"task_id":"task","target_session":"worker"}}"#).unwrap();
+    assert!(matches!(response, PersistedSwarmMutationResponse::AssignTask { routing: None, .. }));
 }
