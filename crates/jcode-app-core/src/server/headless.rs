@@ -249,7 +249,7 @@ pub(super) async fn create_routed_headless_session(
                         );
                     }
                 }
-                super::comm_session::initialized_swarm_execution(actual_provider.as_ref()).ok()
+                super::comm_session::observe_optional_swarm_execution(actual_provider.as_ref())
             }
         };
     }
