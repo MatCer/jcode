@@ -17,6 +17,7 @@ use crate::agent::Agent;
 use crate::config::SwarmSpawnMode;
 use crate::protocol::{NotificationType, ServerEvent, SwarmRoutingStatus};
 use crate::provider::Provider;
+#[cfg(test)]
 use crate::session::Session;
 use jcode_plan::ResolvedExecution;
 use std::collections::{HashMap, HashSet};

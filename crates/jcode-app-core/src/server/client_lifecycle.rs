@@ -74,10 +74,11 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 #[path = "client_lifecycle/processing.rs"]
 mod processing;
+#[cfg(test)]
+pub(super) use processing::process_routed_message_streaming_mpsc;
 use processing::start_processing_message;
 pub(super) use processing::{
     process_locked_message_streaming_mpsc, process_message_streaming_mpsc,
-    process_routed_message_streaming_mpsc,
 };
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
