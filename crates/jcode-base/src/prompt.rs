@@ -88,11 +88,22 @@ pub fn load_swarm_prompt(working_dir: Option<&Path>) -> String {
     let guidance = candidates
         .into_iter()
         .flatten()
-        .find_map(|path| {
-            std::fs::read_to_string(path).ok().and_then(|content| {
+        .find_map(|path| match std::fs::read_to_string(&path) {
+            Ok(content) => {
                 let trimmed = content.trim();
+                // Blank overrides intentionally defer to the next guidance source.
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
-            })
+            }
+            // Override files are optional. Other read failures are not absence:
+            // report them before preserving the existing fallback behavior.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                crate::logging::warn(&format!(
+                    "Cannot read swarm prompt override {}: {error}. Trying the next guidance source.",
+                    path.display()
+                ));
+                None
+            }
         })
         .unwrap_or_else(|| DEFAULT_SWARM_PROMPT.trim().to_string());
     // Every registry, including a nested coordinator's, composes the same public
@@ -1071,3 +1082,7 @@ fn load_preferred_tools_files_from_dir(working_dir: Option<&Path>) -> (Option<St
 #[cfg(test)]
 #[path = "prompt_tests.rs"]
 mod prompt_tests;
+
+#[cfg(test)]
+#[path = "prompt/swarm_guidance_tests.rs"]
+mod swarm_guidance_tests;
