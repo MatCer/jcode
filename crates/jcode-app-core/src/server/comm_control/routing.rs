@@ -112,10 +112,12 @@ pub(in crate::server) async fn admit_node_execution(
         intersect_node_allowed_models(current.as_deref(), meta.allowed_models.as_deref(), &routes);
     let mut routing = admit_swarm_execution(
         requester,
-        meta.model.clone().or(model.clone()),
-        effort.clone(),
-        allowed.as_deref(),
-        meta.resolved_execution.as_ref(),
+        crate::server::comm_session::SwarmExecutionRequest {
+            requested_model: meta.model.clone().or(model.clone()),
+            requested_effort: effort.clone(),
+            requested_allowed: allowed.as_deref(),
+            pinned: meta.resolved_execution.as_ref(),
+        },
         sessions,
         members,
         provider,
@@ -126,10 +128,12 @@ pub(in crate::server) async fn admit_node_execution(
     {
         let override_route = admit_swarm_execution(
             requester,
-            Some(requested),
-            effort,
-            allowed.as_deref(),
-            None,
+            crate::server::comm_session::SwarmExecutionRequest {
+                requested_model: Some(requested),
+                requested_effort: effort,
+                requested_allowed: allowed.as_deref(),
+                pinned: None,
+            },
             sessions,
             members,
             provider,

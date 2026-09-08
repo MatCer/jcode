@@ -373,15 +373,14 @@ pub(in crate::server) fn initialize_swarm_provider(
     provider.set_route_selection(&RouteSelection::from_model_route(&route))?;
     if let Some(effort) = target.effort.as_deref()
         && provider.reasoning_effort().as_deref() != Some(effort)
+        && let Err(error) = provider.set_reasoning_effort(effort)
     {
-        if let Err(error) = provider.set_reasoning_effort(effort) {
-            if enforce_effort {
-                return Err(error);
-            }
-            crate::logging::warn(&format!(
-                "Configured swarm effort could not be applied: {error}"
-            ));
+        if enforce_effort {
+            return Err(error);
         }
+        crate::logging::warn(&format!(
+            "Configured swarm effort could not be applied: {error}"
+        ));
     }
     // Only first admission with omitted caller effort may tolerate a configured
     // default the provider cannot apply. Pin the observed effort, including None,
@@ -470,12 +469,10 @@ pub(in crate::server) fn admit_swarm_spawn_selection(
                         .provider_key
                         .as_deref()
                         .and_then(jcode_provider_core::AuthRoute::parse_explicit_credential_prefix)
-                    {
-                        if jcode_provider_core::ModelRouteApiMethod::parse(auth.route_api_method())
+                        && jcode_provider_core::ModelRouteApiMethod::parse(auth.route_api_method())
                             != route.api_method_kind()
-                        {
-                            return false;
-                        }
+                    {
+                        return false;
                     }
 
                     coordinator.model.as_deref().is_some_and(|model| {
@@ -630,16 +627,26 @@ pub(in crate::server) fn effective_swarm_allowed_models(
 
 /// Shared preclaim admission for direct spawn and the DAG scheduler. A pinned
 /// target is revalidated, never rerouted to a new default on retry/resume.
+pub(in crate::server) struct SwarmExecutionRequest<'a> {
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub requested_allowed: Option<&'a [String]>,
+    pub pinned: Option<&'a ResolvedExecution>,
+}
+
 pub(in crate::server) async fn admit_swarm_execution(
     session_id: &str,
-    requested_model: Option<String>,
-    requested_effort: Option<String>,
-    requested_allowed: Option<&[String]>,
-    pinned: Option<&ResolvedExecution>,
+    request: SwarmExecutionRequest<'_>,
     sessions: &SessionAgents,
     members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     provider: &Arc<dyn Provider>,
 ) -> anyhow::Result<SwarmRoutingStatus> {
+    let SwarmExecutionRequest {
+        requested_model,
+        requested_effort,
+        requested_allowed,
+        pinned,
+    } = request;
     if requested_model
         .as_deref()
         .is_some_and(|s| s.trim().is_empty())
@@ -797,16 +804,16 @@ pub(in crate::server) async fn verify_swarm_session_startup(
             None,
             &routes,
         )?;
-        if let Some(target) = routing.resolved_execution.as_ref() {
-            if !routes.iter().any(|route| {
+        if let Some(target) = routing.resolved_execution.as_ref()
+            && !routes.iter().any(|route| {
                 route.available
                     && same_swarm_execution(&execution_for_route(route, None), target)
                     && permitted_route(route, routing.allowed_models.as_deref())
-            }) {
-                anyhow::bail!(
-                    "Restored swarm execution is unavailable or prohibited by current subtree policy."
-                );
-            }
+            })
+        {
+            anyhow::bail!(
+                "Restored swarm execution is unavailable or prohibited by current subtree policy."
+            );
         }
         routing.selection_enabled = Some(config.swarm_model_selection);
     }

@@ -163,7 +163,16 @@ async fn routing_pinned_effort_admission_preserves_pin_after_config_change() {
     let sessions = Arc::new(RwLock::new(HashMap::new()));
     let members = root_members();
     let admitted = routing::admit_swarm_execution(
-        "root", None, None, None, None, &sessions, &members, &provider,
+        "root",
+        crate::server::comm_session::SwarmExecutionRequest {
+            requested_model: None,
+            requested_effort: None,
+            requested_allowed: None,
+            pinned: None,
+        },
+        &sessions,
+        &members,
+        &provider,
     )
     .await
     .unwrap();
@@ -179,10 +188,12 @@ async fn routing_pinned_effort_admission_preserves_pin_after_config_change() {
     env.configure("low");
     let readmitted = routing::admit_swarm_execution(
         "root",
-        None,
-        None,
-        None,
-        admitted.resolved_execution.as_ref(),
+        crate::server::comm_session::SwarmExecutionRequest {
+            requested_model: None,
+            requested_effort: None,
+            requested_allowed: None,
+            pinned: admitted.resolved_execution.as_ref(),
+        },
         &sessions,
         &members,
         &provider,
@@ -208,7 +219,16 @@ async fn routing_pinned_effort_unpinned_default_records_observed_effort() {
             let sessions = Arc::new(RwLock::new(HashMap::new()));
             let members = root_members();
             let admitted = routing::admit_swarm_execution(
-                "root", None, None, None, None, &sessions, &members, &provider,
+                "root",
+                crate::server::comm_session::SwarmExecutionRequest {
+                    requested_model: None,
+                    requested_effort: None,
+                    requested_allowed: None,
+                    pinned: None,
+                },
+                &sessions,
+                &members,
+                &provider,
             )
             .await
             .unwrap();
@@ -223,10 +243,12 @@ async fn routing_pinned_effort_unpinned_default_records_observed_effort() {
                 assert!(
                     routing::admit_swarm_execution(
                         "root",
-                        None,
-                        requested,
-                        None,
-                        pinned.as_ref(),
+                        crate::server::comm_session::SwarmExecutionRequest {
+                            requested_model: None,
+                            requested_effort: requested,
+                            requested_allowed: None,
+                            pinned: pinned.as_ref(),
+                        },
                         &sessions,
                         &members,
                         &provider,
@@ -290,28 +312,33 @@ async fn routing_pinned_effort_headless_rejection_has_no_orphan() {
         let coordinators = Arc::new(RwLock::new(HashMap::new()));
         let plans = Arc::new(RwLock::new(HashMap::new()));
         let queues = Arc::new(RwLock::new(HashMap::new()));
+        let swarm_state = crate::server::SwarmState {
+            members: Arc::clone(&members),
+            swarms_by_id: Arc::clone(&swarms),
+            coordinators: Arc::clone(&coordinators),
+            plans: Arc::clone(&plans),
+        };
         let result = crate::server::headless::create_routed_headless_session(
             &sessions,
             &global_id,
             &provider,
-            "create_session",
-            &members,
-            &swarms,
-            &coordinators,
-            &plans,
+            &swarm_state,
             &queues,
-            false,
-            None,
-            None,
-            None,
-            Some("high".into()),
-            None,
-            None,
-            crate::server::headless::HeadlessMemoryScope::IsolatedTest,
-            Some(SwarmRoutingStatus {
-                resolved_execution: Some(pin(Some("high"))),
-                ..Default::default()
-            }),
+            crate::server::headless::HeadlessSessionOptions {
+                command: "create_session",
+                selfdev_requested: false,
+                model_override: None,
+                provider_key_override: None,
+                route_api_method_override: None,
+                effort_override: Some("high".into()),
+                mcp_pool: None,
+                report_back_to_session_id: None,
+                memory_scope: crate::server::headless::HeadlessMemoryScope::IsolatedTest,
+                routing: Some(SwarmRoutingStatus {
+                    resolved_execution: Some(pin(Some("high"))),
+                    ..Default::default()
+                }),
+            },
         )
         .await;
         assert!(

@@ -339,10 +339,6 @@ async fn register_visible_spawned_member(
     broadcast_swarm_status(swarm_id, swarm_members, swarms_by_id).await;
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "server-side swarm spawning needs session, swarm state, provider, and event sinks together"
-)]
 /// Resolve the reasoning effort for a spawned swarm worker (#1165).
 ///
 /// Precedence mirrors the model path: an explicit `effort` on the spawn call
@@ -361,6 +357,10 @@ pub(super) fn resolve_swarm_spawn_effort(
     clean(requested_effort).or_else(|| clean(configured_swarm_effort))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "server-side swarm spawning needs session, swarm state, provider, and event sinks together"
+)]
 pub(super) async fn spawn_swarm_agent(
     req_session_id: &str,
     swarm_id: &str,
@@ -388,10 +388,12 @@ pub(super) async fn spawn_swarm_agent(
 ) -> anyhow::Result<String> {
     let mut routing = admit_swarm_execution(
         req_session_id,
-        requested_model.clone(),
-        requested_effort.clone(),
-        allowed_models.as_deref(),
-        pinned_execution.as_ref(),
+        crate::server::comm_session::SwarmExecutionRequest {
+            requested_model: requested_model.clone(),
+            requested_effort: requested_effort.clone(),
+            requested_allowed: allowed_models.as_deref(),
+            pinned: pinned_execution.as_ref(),
+        },
         sessions,
         swarm_members,
         provider_template,
@@ -469,25 +471,30 @@ pub(super) async fn spawn_swarm_agent(
         .as_ref()
         .map(|dir| format!("create_session:{dir}"))
         .unwrap_or_else(|| "create_session".into());
+    let state = SwarmState {
+        members: Arc::clone(swarm_members),
+        swarms_by_id: Arc::clone(swarms_by_id),
+        plans: Arc::clone(swarm_plans),
+        coordinators: Arc::clone(swarm_coordinators),
+    };
     let created = super::headless::create_routed_headless_session(
         sessions,
         global_session_id,
         &initialized_provider,
-        &command,
-        swarm_members,
-        swarms_by_id,
-        swarm_coordinators,
-        swarm_plans,
+        &state,
         soft_interrupt_queues,
-        coordinator_is_canary,
-        spawn_model.clone(),
-        spawn_provider_key.clone(),
-        spawn_route_api_method.clone(),
-        spawn_effort.clone(),
-        Some(Arc::clone(mcp_pool)),
-        Some(req_session_id.to_string()),
-        super::headless::HeadlessMemoryScope::RealProject,
-        Some(routing.clone()),
+        super::headless::HeadlessSessionOptions {
+            command: &command,
+            selfdev_requested: coordinator_is_canary,
+            model_override: spawn_model.clone(),
+            provider_key_override: spawn_provider_key.clone(),
+            route_api_method_override: spawn_route_api_method.clone(),
+            effort_override: spawn_effort.clone(),
+            mcp_pool: Some(Arc::clone(mcp_pool)),
+            report_back_to_session_id: Some(req_session_id.to_string()),
+            memory_scope: super::headless::HeadlessMemoryScope::RealProject,
+            routing: Some(routing.clone()),
+        },
     )
     .await?;
     let created: serde_json::Value = serde_json::from_str(&created)?;
@@ -508,31 +515,24 @@ pub(super) async fn spawn_swarm_agent(
         resolved_spawn_mode,
         SwarmSpawnMode::Visible | SwarmSpawnMode::Auto
     );
-    if visible_requested {
-        if let Some(member) = swarm_members.write().await.get_mut(&new_session_id) {
-            member.is_headless = false;
-            member.status = if startup_message.is_some() {
-                "running"
-            } else {
-                "spawned"
-            }
-            .into();
-            member.detail = Some(
-                if startup_message.is_some() {
-                    "startup queued"
-                } else {
-                    "launching client"
-                }
-                .into(),
-            );
+    if visible_requested && let Some(member) = swarm_members.write().await.get_mut(&new_session_id)
+    {
+        member.is_headless = false;
+        member.status = if startup_message.is_some() {
+            "running"
+        } else {
+            "spawned"
         }
+        .into();
+        member.detail = Some(
+            if startup_message.is_some() {
+                "startup queued"
+            } else {
+                "launching client"
+            }
+            .into(),
+        );
     }
-    let state = SwarmState {
-        members: Arc::clone(swarm_members),
-        swarms_by_id: Arc::clone(swarms_by_id),
-        plans: Arc::clone(swarm_plans),
-        coordinators: Arc::clone(swarm_coordinators),
-    };
     persist_swarm_state_for(swarm_id, &state).await;
     let launched = if visible_requested {
         if let Some(message) = startup_message.as_deref() {
@@ -738,10 +738,12 @@ pub(super) async fn handle_comm_spawn(
     let admission_guard = admission_lock.lock().await;
     if let Err(error) = admit_swarm_execution(
         &req_session_id,
-        model.clone(),
-        effort.clone(),
-        allowed_models.as_deref(),
-        None,
+        crate::server::comm_session::SwarmExecutionRequest {
+            requested_model: model.clone(),
+            requested_effort: effort.clone(),
+            requested_allowed: allowed_models.as_deref(),
+            pinned: None,
+        },
         sessions,
         swarm_members,
         provider_template,

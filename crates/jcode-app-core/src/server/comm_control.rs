@@ -2065,8 +2065,8 @@ async fn handle_comm_assign_task_with_mode(
     )
     .await;
 
-    if let Some(member) = swarm_members.read().await.get(&target_session) {
-        if let Err(error) = member.event_tx.send(ServerEvent::Notification {
+    if let Some(member) = swarm_members.read().await.get(&target_session)
+        && let Err(error) = member.event_tx.send(ServerEvent::Notification {
             from_session: req_session_id.clone(),
             from_name: coordinator_name.clone(),
             notification_type: NotificationType::Message {
@@ -2075,9 +2075,9 @@ async fn handle_comm_assign_task_with_mode(
                 tldr: None,
             },
             message: notification,
-        }) {
-            crate::logging::debug(&format!("Could not deliver task execution event: {error}"));
-        }
+        })
+    {
+        crate::logging::debug(&format!("Could not deliver task execution event: {error}"));
     }
 
     let plan_msg = format!(
@@ -2089,8 +2089,8 @@ async fn handle_comm_assign_task_with_mode(
         if sid == target_session || sid == req_session_id {
             continue;
         }
-        if let Some(member) = members.get(&sid) {
-            if let Err(error) = member.event_tx.send(ServerEvent::Notification {
+        if let Some(member) = members.get(&sid)
+            && let Err(error) = member.event_tx.send(ServerEvent::Notification {
                 from_session: req_session_id.clone(),
                 from_name: coordinator_name.clone(),
                 notification_type: NotificationType::Message {
@@ -2099,9 +2099,9 @@ async fn handle_comm_assign_task_with_mode(
                     tldr: None,
                 },
                 message: plan_msg.clone(),
-            }) {
-                crate::logging::debug(&format!("Could not deliver task execution event: {error}"));
-            }
+            })
+        {
+            crate::logging::debug(&format!("Could not deliver task execution event: {error}"));
         }
     }
 

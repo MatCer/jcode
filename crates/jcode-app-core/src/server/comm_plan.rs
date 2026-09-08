@@ -36,10 +36,6 @@ fn plan_cycle_error(items: &[PlanItem]) -> Option<String> {
     ))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy plan admission uses the same routing policy as DAG specs"
-)]
 async fn admit_legacy_plan_items(
     requester: &str,
     items: &[PlanItem],
@@ -472,9 +468,9 @@ pub(super) async fn handle_comm_approve_plan(
         ))
     } else {
         let members = swarm_members.read().await;
-        if !members
+        if members
             .get(&proposer_session)
-            .is_some_and(|member| member.swarm_id.as_deref() == Some(&swarm_id))
+            .is_none_or(|member| member.swarm_id.as_deref() != Some(&swarm_id))
         {
             Err(anyhow::anyhow!(
                 "Proposal author is unavailable; ask a live member to re-propose."

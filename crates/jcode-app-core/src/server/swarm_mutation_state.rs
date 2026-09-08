@@ -203,8 +203,10 @@ pub(super) async fn begin_or_replay(
         key,
         action,
         session_id,
-        request_id,
-        client_event_tx,
+        SwarmMutationWaiter {
+            request_id,
+            client_event_tx: client_event_tx.clone(),
+        },
         true,
         None,
     )
@@ -224,8 +226,10 @@ pub(super) async fn begin_or_replay_routed_spawn(
         key,
         "spawn",
         session_id,
-        request_id,
-        client_event_tx,
+        SwarmMutationWaiter {
+            request_id,
+            client_event_tx: client_event_tx.clone(),
+        },
         true,
         Some(routing_request),
     )
@@ -252,8 +256,10 @@ pub(super) async fn begin_or_join_in_flight(
         key,
         action,
         session_id,
-        request_id,
-        client_event_tx,
+        SwarmMutationWaiter {
+            request_id,
+            client_event_tx: client_event_tx.clone(),
+        },
         false,
         None,
     )
@@ -265,8 +271,7 @@ async fn begin_with_mode(
     key: &str,
     action: &str,
     session_id: &str,
-    request_id: u64,
-    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+    waiter: SwarmMutationWaiter,
     replay_final: bool,
     routing_request: Option<&str>,
 ) -> Option<PersistedSwarmMutationState> {
@@ -286,8 +291,8 @@ async fn begin_with_mode(
                 .as_deref()
                 .is_some_and(|previous| previous != request)
             {
-                if let Err(error) = client_event_tx.send(ServerEvent::Error {
-                    id: request_id,
+                if let Err(error) = waiter.client_event_tx.send(ServerEvent::Error {
+                    id: waiter.request_id,
                     message: "The spawn request nonce was already used with conflicting routing (model, effort or allowed_models). Use a new nonce for a new worker.".into(),
                     retry_after_secs: None,
                 }) {
@@ -301,8 +306,9 @@ async fn begin_with_mode(
         if replay_final
             && let Some(final_response) = load_state(key).and_then(|state| state.final_response)
         {
-            if let Err(error) =
-                client_event_tx.send(final_response.into_server_event(request_id, session_id))
+            if let Err(error) = waiter
+                .client_event_tx
+                .send(final_response.into_server_event(waiter.request_id, session_id))
             {
                 crate::logging::debug(&format!("Could not deliver swarm mutation event: {error}"));
             }
@@ -311,10 +317,7 @@ async fn begin_with_mode(
         sync.waiters
             .entry(key.to_string())
             .or_default()
-            .push(SwarmMutationWaiter {
-                request_id,
-                client_event_tx: client_event_tx.clone(),
-            });
+            .push(waiter);
         if !sync.active_keys.insert(key.to_string()) {
             return None;
         }

@@ -599,18 +599,18 @@ async fn handle_debug_graph_op(arg: &str, ctx: &DebugSwarmWriteContext<'_>) -> S
     };
     let swarm_id = parsed.swarm_id.clone();
 
-    let actor = parsed.actor.unwrap_or_else(|| String::new());
+    let actor = parsed.actor.unwrap_or_default();
     let actor = if actor.is_empty() {
         ctx.session_id.read().await.clone()
     } else {
         actor
     };
-    if !ctx
+    if ctx
         .swarm_members
         .read()
         .await
         .get(&actor)
-        .is_some_and(|member| member.swarm_id.as_deref() == Some(&swarm_id))
+        .is_none_or(|member| member.swarm_id.as_deref() != Some(&swarm_id))
     {
         return fail("Actor must be an existing member of this swarm.");
     }

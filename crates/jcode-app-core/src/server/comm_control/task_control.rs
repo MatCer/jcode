@@ -557,8 +557,8 @@ crate::logging::debug(&format!("Could not deliver task execution event: {error}"
                         "Task '{displaced_task_id}' takeover committed, but displaced worker '{assignee}' could not receive the stand-down interrupt"
                     ));
                 }
-                if let Some(member) = swarm_members.read().await.get(&assignee) {
-                    if let Err(error) = member.event_tx.send(ServerEvent::Notification {
+                if let Some(member) = swarm_members.read().await.get(&assignee)
+                    && let Err(error) = member.event_tx.send(ServerEvent::Notification {
                         from_session: displaced_req_session,
                         from_name: None,
                         notification_type: NotificationType::Message {
@@ -567,11 +567,11 @@ crate::logging::debug(&format!("Could not deliver task execution event: {error}"
                             tldr: None,
                         },
                         message: stand_down,
-                    }) {
-                        crate::logging::debug(&format!(
-                            "Could not deliver task execution event: {error}"
-                        ));
-                    }
+                    })
+                {
+                    crate::logging::debug(&format!(
+                        "Could not deliver task execution event: {error}"
+                    ));
                 }
             }
         }
