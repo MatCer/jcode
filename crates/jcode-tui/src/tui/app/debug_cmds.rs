@@ -474,6 +474,7 @@ impl App {
                             })
                             .collect(),
                         runtime: crate::protocol::SwarmMemberRuntime {
+                            routing: None,
                             model: Some("gpt-5.6".into()),
                             provider: Some("OpenAI".into()),
                             auth_method: Some("OAuth".into()),
@@ -1165,4 +1166,21 @@ fn attach_redraw_schedule_debug(payload: &mut serde_json::Value, app: &App) {
             "is_processing": crate::tui::TuiState::is_processing(app),
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn synthetic_swarm_gallery_does_not_claim_verified_routing() {
+        let mut app = crate::tui::app::tests::create_test_app();
+        let result = app.handle_debug_command("swarm-gallery:3");
+
+        assert!(result.starts_with("OK: injected 3"));
+        assert_eq!(app.remote_swarm_members.len(), 3);
+        for member in &app.remote_swarm_members {
+            assert!(member.runtime.routing.is_none());
+            let runtime = serde_json::to_value(&member.runtime).unwrap();
+            assert!(runtime.get("routing").is_none());
+        }
+    }
 }

@@ -126,6 +126,7 @@ mod tests {
             next_ready_ids: vec!["task-2".to_string()],
             newly_ready_ids: vec!["task-3".to_string()],
             low_confidence_ids: Vec::new(),
+            node_routing: Default::default(),
             mode: "light".to_string(),
         }
     }

@@ -773,10 +773,6 @@ pub enum Request {
 /// Server event sent to client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "wire protocol prioritizes straightforward serde payloads over boxing every larger event variant"
-)]
 pub enum ServerEvent {
     /// An autonomous wake was requested. In external wake mode this event is
     /// emitted instead of starting or injecting into a turn.
